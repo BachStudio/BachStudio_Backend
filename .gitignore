@@ -8,3 +8,5 @@ venv/
 
 # IDE
 .vscode/
+
+.env
