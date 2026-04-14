@@ -7,4 +7,4 @@ from app.core.config import settings
 
 @lru_cache
 def get_supabase_client() -> Client:
-	return create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
+	return create_client(settings.SUPABASE_URL, settings.SUPABASE_PUBLISHABLE_KEY)
