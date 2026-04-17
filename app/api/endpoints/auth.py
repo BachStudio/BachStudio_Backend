@@ -1,6 +1,6 @@
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, EmailStr, Field
 from supabase import Client
 
@@ -37,6 +37,15 @@ class TokenResponse(BaseModel):
 
 class GoogleOAuthUrlResponse(BaseModel):
 	url: str
+
+
+class GoogleIdTokenLoginRequest(BaseModel):
+	id_token: str = Field(min_length=20, max_length=8192)
+	nonce: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class GoogleCodeExchangeRequest(BaseModel):
+	auth_code: str = Field(min_length=8, max_length=4096)
 
 
 def _serialize_user(raw_user: Any) -> AuthUserResponse:
@@ -113,6 +122,33 @@ def _extract_oauth_url(oauth_response: Any) -> str | None:
 	return None
 
 
+def _sign_in_with_google_id_token(
+	supabase: Client,
+	id_token: str,
+	nonce: str | None = None,
+) -> Any:
+	payload: dict[str, Any] = {"provider": "google", "token": id_token}
+	if nonce:
+		payload["nonce"] = nonce
+
+	try:
+		return supabase.auth.sign_in_with_id_token(payload)
+	except TypeError:
+		return supabase.auth.sign_in_with_id_token(**payload)
+
+
+def _exchange_google_auth_code(supabase: Client, auth_code: str) -> Any:
+	payload: dict[str, Any] = {"auth_code": auth_code}
+
+	try:
+		return supabase.auth.exchange_code_for_session(payload)
+	except TypeError:
+		try:
+			return supabase.auth.exchange_code_for_session(auth_code=auth_code)
+		except TypeError:
+			return supabase.auth.exchange_code_for_session(auth_code)
+
+
 @router.post("/signup", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 def signup(payload: SignupRequest, supabase: Client = Depends(get_supabase)) -> TokenResponse:
 	signup_payload: dict[str, Any] = {
@@ -186,6 +222,94 @@ def login_google(supabase: Client = Depends(get_supabase)) -> GoogleOAuthUrlResp
 		)
 
 	return GoogleOAuthUrlResponse(url=oauth_url)
+
+
+@router.post("/login/google/id-token", response_model=TokenResponse)
+def login_google_with_id_token(
+	payload: GoogleIdTokenLoginRequest,
+	supabase: Client = Depends(get_supabase),
+) -> TokenResponse:
+	if not hasattr(supabase.auth, "sign_in_with_id_token"):
+		raise HTTPException(
+			status_code=status.HTTP_501_NOT_IMPLEMENTED,
+			detail="Current Supabase SDK does not support Google ID token sign-in",
+		)
+
+	try:
+		auth_response = _sign_in_with_google_id_token(
+			supabase=supabase,
+			id_token=payload.id_token,
+			nonce=payload.nonce,
+		)
+	except Exception as exc:
+		raise HTTPException(
+			status_code=status.HTTP_401_UNAUTHORIZED,
+			detail="Google ID token login failed",
+		) from exc
+
+	if getattr(auth_response, "session", None) is None:
+		raise HTTPException(
+			status_code=status.HTTP_401_UNAUTHORIZED,
+			detail="Google ID token login failed. Check token validity.",
+		)
+
+	return _build_token_response(auth_response)
+
+
+@router.post("/login/google/code", response_model=TokenResponse)
+def login_google_with_auth_code(
+	payload: GoogleCodeExchangeRequest,
+	supabase: Client = Depends(get_supabase),
+) -> TokenResponse:
+	if not hasattr(supabase.auth, "exchange_code_for_session"):
+		raise HTTPException(
+			status_code=status.HTTP_501_NOT_IMPLEMENTED,
+			detail="Current Supabase SDK does not support auth code exchange",
+		)
+
+	try:
+		auth_response = _exchange_google_auth_code(supabase=supabase, auth_code=payload.auth_code)
+	except Exception as exc:
+		raise HTTPException(
+			status_code=status.HTTP_401_UNAUTHORIZED,
+			detail="Google auth code exchange failed",
+		) from exc
+
+	if getattr(auth_response, "session", None) is None:
+		raise HTTPException(
+			status_code=status.HTTP_401_UNAUTHORIZED,
+			detail="Google auth code exchange failed. Check code validity.",
+		)
+
+	return _build_token_response(auth_response)
+
+
+@router.get("/login/google/callback", response_model=TokenResponse)
+def login_google_callback(
+	code: str = Query(min_length=8, max_length=4096),
+	supabase: Client = Depends(get_supabase),
+) -> TokenResponse:
+	if not hasattr(supabase.auth, "exchange_code_for_session"):
+		raise HTTPException(
+			status_code=status.HTTP_501_NOT_IMPLEMENTED,
+			detail="Current Supabase SDK does not support auth code exchange",
+		)
+
+	try:
+		auth_response = _exchange_google_auth_code(supabase=supabase, auth_code=code)
+	except Exception as exc:
+		raise HTTPException(
+			status_code=status.HTTP_401_UNAUTHORIZED,
+			detail="Google auth code exchange failed",
+		) from exc
+
+	if getattr(auth_response, "session", None) is None:
+		raise HTTPException(
+			status_code=status.HTTP_401_UNAUTHORIZED,
+			detail="Google auth code exchange failed. Check code validity.",
+		)
+
+	return _build_token_response(auth_response)
 
 
 @router.get("/validate")
