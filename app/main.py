@@ -3,10 +3,12 @@ from fastapi import FastAPI
 from app.api.router import api_router
 from app.core.config import settings
 
+from app.api.endpoints import collects
 app = FastAPI(
 	title=settings.PROJECT_NAME,
 	debug=settings.DEBUG,
 )
+app.include_router(collects.router, prefix="/collects", tags=["collects"])
 
 app.include_router(api_router, prefix=settings.API_PREFIX)
 
@@ -20,3 +22,5 @@ def root() -> dict[str, str]:
 def health() -> dict[str, str]:
 	return {"status": "ok"}
 
+from app.api.endpoints import projects
+app.include_router(projects.router, prefix="/projects", tags=["projects"])
