@@ -3,7 +3,7 @@ from typing import List
 from uuid import UUID
 from app.api import deps
 from app.schemas.collect import Collect, CollectCreate, CollectUpdate
-from app.services.collect_service import CollectService
+from app.services.collect import CollectService
 
 router = APIRouter()
 
