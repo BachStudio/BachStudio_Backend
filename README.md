@@ -1,14 +1,14 @@
 # BachStudio Backend
 
-BachStudio 백엔드는 프론트엔드 웹 DAW와 `BachStudio_Ai` 음정 분석 엔진 사이를 연결하는 FastAPI 서버입니다.
+BachStudio 백엔드는 프론트엔드 웹 DAW와 음정 분석 엔진을 연결하는 FastAPI 서버입니다.
 
-현재 가장 중요한 역할은 브라우저에서 녹음한 허밍/보컬 오디오를 받아서, 프론트엔드 피아노롤에 바로 넣을 수 있는 MIDI 노트 데이터로 바꿔주는 것입니다. 그 외에 로그인, 유저, 아이템 API는 Supabase 연동을 위한 기본 구조로 들어가 있습니다.
+현재 가장 중요한 역할은 브라우저에서 녹음한 허밍/보컬 오디오를 받아서, 프론트엔드 피아노롤에 바로 넣을 수 있는 MIDI 노트 데이터로 바꿔주는 것입니다. 이 기능에 필요한 기본 DSP 음정 분석 엔진은 백엔드 폴더 안에 내장되어 있어서 `BachStudio_Ai` 폴더가 없어도 동작합니다. 그 외에 로그인, 유저, 아이템 API는 Supabase 연동을 위한 기본 구조로 들어가 있습니다.
 
 ## 이 백엔드가 하는 일
 
 - 프론트엔드에서 보낸 오디오 파일을 받습니다.
 - `webm`, `wav`, `mp3` 같은 브라우저 녹음 파일을 16 kHz mono WAV로 변환합니다.
-- `BachStudio_Ai` 엔진을 실행해 시간별 pitch frame을 분석합니다.
+- 백엔드 내부 AI 엔진을 실행해 시간별 pitch frame을 분석합니다.
 - 분석 결과를 피아노롤에서 쓰기 쉬운 노트 목록으로 묶습니다.
 - 프론트엔드가 기대하는 형태인 `midi`, `note`, `startBeat`, `durationBeats`, `confidence` JSON을 반환합니다.
 - 프론트엔드 개발 서버에서 호출할 수 있도록 CORS를 허용합니다.
@@ -20,6 +20,13 @@ BachStudio 백엔드는 프론트엔드 웹 DAW와 `BachStudio_Ai` 음정 분석
 BachStudio_Backend/
 ├── app/
 │   ├── main.py                    # FastAPI 앱 생성, CORS, 라우터 등록
+│   ├── ai_engine/                 # 내장 음정 분석 엔진
+│   │   ├── engine.py              # WAV 분석 실행
+│   │   ├── audio_io.py            # WAV 로딩, resample
+│   │   ├── postprocess.py         # pitch smoothing, MIDI 변환
+│   │   └── estimators/
+│   │       ├── dsp_estimator.py   # 기본 DSP 음정 추정기
+│   │       └── rmvpe_estimator.py # 선택적 RMVPE 추정기
 │   ├── core/
 │   │   ├── config.py              # 환경변수와 서버 설정
 │   │   ├── security.py            # JWT 생성/검증
@@ -41,7 +48,8 @@ BachStudio_Backend/
 │   │   ├── user.py                # Supabase 유저 접근 로직
 │   │   └── item.py                # Supabase 아이템 접근 로직
 │   └── utils/
-└── requirements.txt
+├── requirements.txt
+└── requirements-rmvpe.txt          # 선택: RMVPE 사용 시 설치
 ```
 
 ## 실행 방법
@@ -65,10 +73,10 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-AI 엔진도 같이 설치합니다. 로컬 모노레포 구조에서는 아래 명령을 쓰면 됩니다.
+기본 DSP 분석만 쓸 거라면 여기까지 설치하면 됩니다. RMVPE까지 쓰고 싶으면 추가 의존성을 설치합니다.
 
 ```bash
-python -m pip install -e ../BachStudio_Ai
+python -m pip install -r requirements-rmvpe.txt
 ```
 
 서버를 실행합니다.
@@ -95,10 +103,32 @@ GET http://127.0.0.1:8000/api/v1/health
 
 1. 업로드된 오디오 파일을 임시 폴더에 저장합니다.
 2. `ffmpeg`가 설치되어 있으면 오디오를 16 kHz mono WAV로 변환합니다.
-3. `BachStudio_Ai`의 `RealtimePitchEngine`으로 pitch frame을 분석합니다.
+3. 백엔드 내부 `app/ai_engine`의 `RealtimePitchEngine`으로 pitch frame을 분석합니다.
 4. 연속된 voiced frame을 하나의 음표 segment로 묶습니다.
 5. BPM과 quantize 값을 기준으로 `startBeat`, `durationBeats`를 계산합니다.
 6. MIDI 번호와 화면 표시용 음 이름을 만들어 JSON으로 반환합니다.
+
+### DSP와 RMVPE
+
+백엔드에는 두 가지 음정 추정 경로가 있습니다.
+
+| 방식 | 설명 | 필요한 설치 |
+| --- | --- | --- |
+| DSP | 백엔드에 기본 내장된 autocorrelation 기반 pitch 추정기입니다. 설치가 가볍고 바로 동작합니다. | `requirements.txt` |
+| RMVPE | 보컬/허밍 pitch 추정 품질을 높이기 위한 모델 기반 추정기입니다. 패키지와 모델 로딩이 필요할 수 있습니다. | `requirements.txt` + `requirements-rmvpe.txt` |
+
+`.env`에서 `AI_PREFER_RMVPE=true`이면 서버는 RMVPE를 먼저 시도합니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
+
+```env
+AI_PREFER_RMVPE=true
+AI_RMVPE_MODEL_PATH=
+```
+
+`AI_RMVPE_MODEL_PATH`는 `BachStudio_Ai` 폴더 경로가 아니라 RMVPE 모델 파일 경로입니다. `rmvpe-onnx`가 기본 모델을 알아서 찾을 수 있는 환경이면 비워둬도 됩니다. 직접 받은 모델 파일을 쓰는 경우에만 아래처럼 적습니다.
+
+```env
+AI_RMVPE_MODEL_PATH=/absolute/path/to/rmvpe.onnx
+```
 
 ### 요청
 
@@ -213,8 +243,8 @@ AI_MAX_AUDIO_SECONDS=12
 | 변수 | 설명 |
 | --- | --- |
 | `CORS_ORIGINS` | 프론트엔드 개발 서버 주소입니다. `.env`에서는 JSON 배열 형태로 넣습니다. |
-| `AI_PREFER_RMVPE` | `true`면 RMVPE를 먼저 사용하고, 실패하면 DSP 추정기로 fallback합니다. |
-| `AI_RMVPE_MODEL_PATH` | RMVPE 모델 파일 경로입니다. 필요할 때 지정합니다. |
+| `AI_PREFER_RMVPE` | `true`면 RMVPE를 먼저 시도하고, 실패하면 내장 DSP 추정기로 fallback합니다. |
+| `AI_RMVPE_MODEL_PATH` | 선택적 RMVPE 모델 파일 경로입니다. 없으면 비워둡니다. `BachStudio_Ai` 폴더 경로를 넣는 값이 아닙니다. |
 | `AI_CONFIDENCE_THRESHOLD` | 이 값보다 confidence가 낮은 pitch frame은 버립니다. |
 | `AI_MIN_NOTE_DURATION_BEATS` | 너무 짧은 노트를 제거하기 위한 최소 beat 길이입니다. |
 | `AI_MAX_FRAME_GAP_MS` | 이 시간보다 frame 간격이 벌어지면 다른 노트로 분리합니다. |
@@ -236,6 +266,8 @@ ffmpeg -version
 ## 개발 상태와 주의할 점
 
 - Humming AI API는 실제 프론트 연결을 위한 핵심 기능입니다.
+- 기본 음정 분석은 백엔드 내부 `app/ai_engine`으로 동작하므로 `BachStudio_Ai` 폴더가 없어도 서버를 실행할 수 있습니다.
+- `BachStudio_Ai` 폴더는 별도 AI 개발/실험용으로 남겨둘 수 있고, 현재 백엔드 런타임 필수 의존성은 아닙니다.
 - Auth/User/Item API는 기본 구조와 개발용 fallback이 들어간 상태입니다.
 - `/api/v1/auth/login`은 현재 실제 Supabase Auth 비밀번호 검증이 아니라 JWT 발급 샘플에 가깝습니다.
 - 프로젝트 저장은 아직 백엔드가 아니라 프론트엔드 `localStorage` 중심입니다.

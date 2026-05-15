@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,22 +11,10 @@ from statistics import mean, median
 from fastapi import HTTPException, UploadFile, status
 
 from app.core.config import settings
+from app.ai_engine.config import EngineConfig
+from app.ai_engine.engine import RealtimePitchEngine
+from app.ai_engine.types import PitchFrame
 from app.schemas.humming import HummingNote, HummingTranscriptionResponse
-
-
-AI_SRC_PATH = Path(__file__).resolve().parents[3] / "BachStudio_Ai" / "src"
-if AI_SRC_PATH.exists() and str(AI_SRC_PATH) not in sys.path:
-	sys.path.append(str(AI_SRC_PATH))
-
-try:
-	from bachstudio_ai.config import EngineConfig
-	from bachstudio_ai.engine import RealtimePitchEngine
-	from bachstudio_ai.types import PitchFrame
-except ImportError as exc:  # pragma: no cover - exercised only when setup is incomplete
-	raise RuntimeError(
-		"bachstudio_ai is not importable. Install it with `pip install -e ../BachStudio_Ai` "
-		"or keep the monorepo layout intact."
-	) from exc
 
 
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -85,6 +72,10 @@ def transcribe_upload(
 
 
 def normalize_audio(input_path: Path, output_path: Path) -> None:
+	if input_path.suffix.lower() == ".wav":
+		shutil.copyfile(input_path, output_path)
+		return
+
 	ffmpeg_path = shutil.which("ffmpeg")
 	if ffmpeg_path:
 		command = [
@@ -110,11 +101,7 @@ def normalize_audio(input_path: Path, output_path: Path) -> None:
 			raise HTTPException(
 				status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
 				detail=f"Could not decode uploaded audio: {result.stderr.strip() or 'ffmpeg failed'}",
-			)
-		return
-
-	if input_path.suffix.lower() == ".wav":
-		shutil.copyfile(input_path, output_path)
+		)
 		return
 
 	raise HTTPException(
