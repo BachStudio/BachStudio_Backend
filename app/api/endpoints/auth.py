@@ -7,7 +7,7 @@ from supabase import Client
 from app.api.deps import get_current_user, get_supabase
 from app.core.config import settings
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="", tags=["auth"])
 
 
 class SignupRequest(BaseModel):
@@ -124,11 +124,13 @@ def signup(payload: SignupRequest, supabase: Client = Depends(get_supabase)) -> 
 
 	try:
 		auth_response = supabase.auth.sign_up(signup_payload)
+		# 예시 (auth.py 내부의 회원가입 예외 처리 부분)
 	except Exception as exc:
+		print("🔴 회원가입 실제 에러 발생:", str(exc))  # 터미널에서 확인하기 위함
 		raise HTTPException(
-			status_code=status.HTTP_400_BAD_REQUEST,
-			detail="Signup failed",
-		) from exc
+        	status_code=status.HTTP_400_BAD_REQUEST,
+        	detail=f"Signup failed: {str(exc)}"  # 클라이언트 응답에도 상세 에러 포함
+    	)
 
 	message = None
 	if getattr(auth_response, "session", None) is None:

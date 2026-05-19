@@ -1,17 +1,16 @@
 from fastapi import FastAPI
-
 from app.api.endpoints.router import api_router
 from app.core.config import settings
 
-from app.api.endpoints import collects
+print("🔴 현재 등록된 Supabase URL:", repr(settings.SUPABASE_URL))
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json"
 )
-app.include_router(collects.router, prefix="/collects", tags=["collects"])
 
+# router.py에서 묶어둔 모든 엔드포인트를 한 번에 등록합니다.
 app.include_router(api_router, prefix=settings.API_PREFIX)
-
 
 @app.get("/", tags=["health"])
 def root() -> dict[str, str]:
@@ -25,5 +24,3 @@ def health_check():
 def health() -> dict[str, str]:
 	return {"status": "ok"}
 
-from app.api.endpoints import projects
-app.include_router(projects.router, prefix="/projects", tags=["projects"])
