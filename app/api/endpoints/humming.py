@@ -1,7 +1,8 @@
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile, WebSocket
 
 from app.schemas.humming import HummingTranscriptionResponse
 from app.services import humming as humming_service
+from app.services import humming_stream
 
 router = APIRouter(prefix="/humming", tags=["humming"])
 
@@ -20,3 +21,7 @@ def transcribe_humming(
 		quantize=quantize,
 	)
 
+
+@router.websocket("/stream")
+async def stream_humming(websocket: WebSocket) -> None:
+	await humming_stream.stream_humming(websocket)

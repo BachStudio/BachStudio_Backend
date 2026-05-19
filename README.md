@@ -2,14 +2,15 @@
 
 BachStudio 백엔드는 프론트엔드 웹 DAW와 음정 분석 엔진을 연결하는 FastAPI 서버입니다.
 
-현재 가장 중요한 역할은 브라우저에서 녹음한 허밍/보컬 오디오를 받아서, 프론트엔드 피아노롤에 바로 넣을 수 있는 MIDI 노트 데이터로 바꿔주는 것입니다. 이 기능에 필요한 기본 DSP 음정 분석 엔진은 백엔드 폴더 안에 내장되어 있어서 `BachStudio_Ai` 폴더가 없어도 동작합니다. 그 외에 로그인, 유저, 아이템 API는 Supabase 연동을 위한 기본 구조로 들어가 있습니다.
+현재 가장 중요한 역할은 브라우저 마이크에서 들어오는 허밍/보컬 오디오를 실시간으로 분석해서, 프론트엔드 피아노롤에 바로 넣을 수 있는 pitch/note 이벤트를 돌려주는 것입니다. 이 기능에 필요한 기본 DSP 음정 분석 엔진은 백엔드 폴더 안에 내장되어 있어서 `BachStudio_Ai` 폴더가 없어도 동작합니다. 그 외에 녹음 후 파일 변환 API, 로그인, 유저, 아이템 API는 보조 기능 또는 Supabase 연동을 위한 기본 구조로 들어가 있습니다.
 
 ## 이 백엔드가 하는 일
 
-- 프론트엔드에서 보낸 오디오 파일을 받습니다.
-- `webm`, `wav`, `mp3` 같은 브라우저 녹음 파일을 16 kHz mono WAV로 변환합니다.
-- 백엔드 내부 AI 엔진을 실행해 시간별 pitch frame을 분석합니다.
-- 분석 결과를 피아노롤에서 쓰기 쉬운 노트 목록으로 묶습니다.
+- 프론트엔드가 WebSocket으로 보내는 실시간 PCM 오디오 chunk를 받습니다.
+- 오디오 chunk를 16 kHz mono 분석 샘플로 맞춘 뒤 pitch frame을 즉시 분석합니다.
+- 분석 결과를 `pitch`, `note_on`, `note_update`, `note_off`, `complete` 이벤트로 반환합니다.
+- 녹음 후 파일 업로드 방식도 보조 API로 지원합니다.
+- `webm`, `wav`, `mp3` 같은 녹음 파일을 16 kHz mono WAV로 변환할 수 있습니다.
 - 프론트엔드가 기대하는 형태인 `midi`, `note`, `startBeat`, `durationBeats`, `confidence` JSON을 반환합니다.
 - 프론트엔드 개발 서버에서 호출할 수 있도록 CORS를 허용합니다.
 - Supabase 기반 유저/아이템 API를 붙일 수 있는 기본 구조를 제공합니다.
@@ -97,16 +98,167 @@ http://127.0.0.1:8000
 GET http://127.0.0.1:8000/api/v1/health
 ```
 
-## Humming AI 기능
+## Humming AI 실시간 기능
 
-프론트엔드의 피아노롤 `Humming AI` 패널에서 녹음된 오디오를 서버로 보내면, 백엔드는 다음 순서로 처리합니다.
+프론트엔드의 피아노롤 `Humming AI` 패널에서 마이크 입력을 받으면, 프론트는 짧은 PCM 오디오 chunk를 WebSocket으로 계속 보냅니다. 백엔드는 chunk가 들어올 때마다 pitch를 분석하고, 프론트가 바로 그릴 수 있는 이벤트를 다시 보냅니다.
 
-1. 업로드된 오디오 파일을 임시 폴더에 저장합니다.
-2. `ffmpeg`가 설치되어 있으면 오디오를 16 kHz mono WAV로 변환합니다.
-3. 백엔드 내부 `app/ai_engine`의 `RealtimePitchEngine`으로 pitch frame을 분석합니다.
-4. 연속된 voiced frame을 하나의 음표 segment로 묶습니다.
-5. BPM과 quantize 값을 기준으로 `startBeat`, `durationBeats`를 계산합니다.
-6. MIDI 번호와 화면 표시용 음 이름을 만들어 JSON으로 반환합니다.
+실시간 흐름은 아래와 같습니다.
+
+1. 프론트엔드가 `ws://127.0.0.1:8000/api/humming/stream`에 연결합니다.
+2. 연결 직후 백엔드는 `ready` 이벤트를 보냅니다.
+3. 프론트엔드는 `AudioContext` 또는 `AudioWorklet`에서 얻은 mono `Float32Array` PCM chunk를 binary message로 보냅니다.
+4. 백엔드는 chunk를 16 kHz mono 분석 샘플로 맞추고 내부 `app/ai_engine`의 `RealtimePitchEngine`으로 pitch frame을 분석합니다.
+5. 백엔드는 `pitch` 이벤트를 계속 반환합니다.
+6. voiced frame이 이어지면 `note_on`, `note_update`, `note_off` 이벤트로 note segment를 실시간 추적합니다.
+7. 프론트가 `{"type":"stop"}`을 보내면 백엔드는 마지막 note를 닫고 `complete` 이벤트로 최종 `notes` 배열을 반환합니다.
+
+### WebSocket 요청
+
+```text
+WS /api/humming/stream
+WS /api/v1/humming/stream
+```
+
+쿼리 파라미터로 기본 설정을 줄 수 있습니다.
+
+```text
+ws://127.0.0.1:8000/api/humming/stream?sampleRate=48000&bpm=120&clipLengthBeats=8&quantize=1/16
+```
+
+또는 연결 후 첫 text message로 설정을 보낼 수 있습니다.
+
+```json
+{
+  "type": "start",
+  "sampleRate": 48000,
+  "bpm": 120,
+  "clipLengthBeats": 8,
+  "quantize": "1/16",
+  "preferRmvpe": false
+}
+```
+
+필드 의미는 아래와 같습니다.
+
+| 필드 | 설명 | 기본값 |
+| --- | --- | --- |
+| `sampleRate` | 브라우저 `AudioContext.sampleRate` 값입니다. 보통 `48000` 또는 `44100`입니다. | `48000` |
+| `bpm` | 현재 프로젝트 BPM입니다. | `120` |
+| `clipLengthBeats` | 현재 피아노롤 클립 길이입니다. | `8` |
+| `quantize` | 노트 시작/길이 보정 단위입니다. | `1/16` |
+| `preferRmvpe` | 실시간 스트림에서도 RMVPE를 먼저 쓸지 여부입니다. 낮은 지연을 원하면 `false`를 권장합니다. | `false` |
+
+### 오디오 binary 형식
+
+WebSocket binary message는 아래 형식이어야 합니다.
+
+```text
+Float32 little-endian PCM
+mono
+range: -1.0 ~ 1.0
+```
+
+즉 프론트에서 `Float32Array`를 만들고 그 `ArrayBuffer`를 그대로 보내면 됩니다.
+
+```ts
+socket.send(float32Chunk.buffer);
+```
+
+`MediaRecorder`가 만드는 `webm` chunk를 실시간 WebSocket에 바로 보내면 안 됩니다. `webm`은 압축 컨테이너라서 chunk마다 바로 pitch frame으로 해석하기 어렵습니다. 실시간 기능은 `AudioWorklet`이나 `ScriptProcessorNode`에서 나온 raw PCM을 보내는 방식입니다.
+
+### 서버 이벤트
+
+연결 직후 백엔드는 `ready` 이벤트를 보냅니다.
+
+```json
+{
+  "type": "ready",
+  "inputFormat": "float32le",
+  "channels": 1,
+  "sourceSampleRate": 48000,
+  "analysisSampleRate": 16000,
+  "frameLength": 1024,
+  "hopLength": 160,
+  "bpm": 120,
+  "clipLengthBeats": 8,
+  "quantize": "1/16",
+  "source": "dsp_acf"
+}
+```
+
+실시간 pitch frame은 아래처럼 옵니다.
+
+```json
+{
+  "type": "pitch",
+  "timestampMs": 120,
+  "beat": 0.24,
+  "f0Hz": 440.1,
+  "midi": 69,
+  "note": "A4",
+  "cents": 0.4,
+  "voiced": true,
+  "confidence": 0.91,
+  "source": "dsp_acf"
+}
+```
+
+노트가 시작되면 `note_on`이 옵니다.
+
+```json
+{
+  "type": "note_on",
+  "note": {
+    "midi": 69,
+    "note": "A4",
+    "startBeat": 0,
+    "durationBeats": 0.25,
+    "confidence": 0.91
+  }
+}
+```
+
+노트가 이어지는 동안 `note_update`가 오고, 음이 끊기거나 pitch가 크게 바뀌면 `note_off`가 옵니다.
+
+```json
+{
+  "type": "note_off",
+  "reason": "unvoiced",
+  "note": {
+    "midi": 69,
+    "note": "A4",
+    "startBeat": 0,
+    "durationBeats": 1,
+    "confidence": 0.9
+  }
+}
+```
+
+프론트가 stop을 보내면:
+
+```json
+{
+  "type": "stop"
+}
+```
+
+백엔드는 최종 결과를 반환합니다.
+
+```json
+{
+  "type": "complete",
+  "key": "A major/minor",
+  "notes": [
+    {
+      "midi": 69,
+      "note": "A4",
+      "startBeat": 0,
+      "durationBeats": 1,
+      "confidence": 0.9
+    }
+  ]
+}
+```
 
 ### DSP와 RMVPE
 
@@ -115,9 +267,9 @@ GET http://127.0.0.1:8000/api/v1/health
 | 방식 | 설명 | 필요한 설치 |
 | --- | --- | --- |
 | DSP | 백엔드에 기본 내장된 autocorrelation 기반 pitch 추정기입니다. 설치가 가볍고 바로 동작합니다. | `requirements.txt` |
-| RMVPE | 보컬/허밍 pitch 추정 품질을 높이기 위한 모델 기반 추정기입니다. 패키지와 모델 로딩이 필요할 수 있습니다. | `requirements.txt` + `requirements-rmvpe.txt` |
+| RMVPE | 보컬/허밍 pitch 추정 품질을 높이기 위한 모델 기반 추정기입니다. 실시간 스트림에서는 지연이 더 커질 수 있습니다. | `requirements.txt` + `requirements-rmvpe.txt` |
 
-`.env`에서 `AI_PREFER_RMVPE=true`이면 서버는 RMVPE를 먼저 시도합니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
+녹음 후 변환 API는 `.env`의 `AI_PREFER_RMVPE=true`를 따릅니다. 실시간 WebSocket은 낮은 지연을 위해 기본적으로 DSP를 사용하고, 연결 설정에서 `preferRmvpe=true`를 보낼 때만 RMVPE를 시도합니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
 
 ```env
 AI_PREFER_RMVPE=true
@@ -129,6 +281,10 @@ AI_RMVPE_MODEL_PATH=
 ```env
 AI_RMVPE_MODEL_PATH=/absolute/path/to/rmvpe.onnx
 ```
+
+## 녹음 후 변환 API
+
+실시간이 아니라 “녹음 완료 후 한 번에 변환”하고 싶을 때는 기존 HTTP API를 사용할 수 있습니다.
 
 ### 요청
 
@@ -201,8 +357,10 @@ length = durationBeats * PIANO_STEPS_PER_BEAT
 | --- | --- | --- |
 | `GET` | `/` | 서버가 실행 중인지 간단히 확인합니다. |
 | `GET` | `/api/v1/health` | health check API입니다. |
-| `POST` | `/api/humming/transcribe` | 프론트 권장 Humming AI 변환 API입니다. |
-| `POST` | `/api/v1/humming/transcribe` | 버전 prefix가 붙은 Humming AI 변환 API입니다. |
+| `WS` | `/api/humming/stream` | 프론트 권장 Humming AI 실시간 스트리밍 API입니다. |
+| `WS` | `/api/v1/humming/stream` | 버전 prefix가 붙은 Humming AI 실시간 스트리밍 API입니다. |
+| `POST` | `/api/humming/transcribe` | 녹음 후 파일 업로드 변환 API입니다. |
+| `POST` | `/api/v1/humming/transcribe` | 버전 prefix가 붙은 녹음 후 파일 업로드 변환 API입니다. |
 | `POST` | `/api/v1/auth/signup` | 유저 생성 API입니다. Supabase `users` 테이블에 저장을 시도합니다. |
 | `POST` | `/api/v1/auth/login` | 이메일 기반 JWT 토큰을 발급합니다. 현재는 실제 비밀번호 검증이 아니라 개발용 기본 구현입니다. |
 | `GET` | `/api/v1/auth/validate` | `Authorization: Bearer <token>` 토큰을 검증합니다. |
@@ -265,7 +423,8 @@ ffmpeg -version
 
 ## 개발 상태와 주의할 점
 
-- Humming AI API는 실제 프론트 연결을 위한 핵심 기능입니다.
+- Humming AI 실시간 WebSocket API가 실제 프론트 연결을 위한 핵심 기능입니다.
+- `POST /api/humming/transcribe`는 녹음 후 변환용 보조 API로 남겨두었습니다.
 - 기본 음정 분석은 백엔드 내부 `app/ai_engine`으로 동작하므로 `BachStudio_Ai` 폴더가 없어도 서버를 실행할 수 있습니다.
 - `BachStudio_Ai` 폴더는 별도 AI 개발/실험용으로 남겨둘 수 있고, 현재 백엔드 런타임 필수 의존성은 아닙니다.
 - Auth/User/Item API는 기본 구조와 개발용 fallback이 들어간 상태입니다.
