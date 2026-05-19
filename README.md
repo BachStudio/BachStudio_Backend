@@ -134,7 +134,7 @@ ws://127.0.0.1:8000/api/humming/stream?sampleRate=48000&bpm=120&clipLengthBeats=
   "bpm": 120,
   "clipLengthBeats": 8,
   "quantize": "1/16",
-  "preferRmvpe": false
+  "preferRmvpe": true
 }
 ```
 
@@ -146,7 +146,7 @@ ws://127.0.0.1:8000/api/humming/stream?sampleRate=48000&bpm=120&clipLengthBeats=
 | `bpm` | 현재 프로젝트 BPM입니다. | `120` |
 | `clipLengthBeats` | 현재 피아노롤 클립 길이입니다. | `8` |
 | `quantize` | 노트 시작/길이 보정 단위입니다. | `1/16` |
-| `preferRmvpe` | 실시간 스트림에서도 RMVPE를 먼저 쓸지 여부입니다. 낮은 지연을 원하면 `false`를 권장합니다. | `false` |
+| `preferRmvpe` | 실시간 스트림에서 RMVPE를 먼저 쓸지 여부입니다. 생략하면 `.env`의 `AI_PREFER_RMVPE` 값을 따릅니다. 낮은 지연이 더 중요하면 `false`로 보낼 수 있습니다. | `.env`의 `AI_PREFER_RMVPE` |
 
 ### 오디오 binary 형식
 
@@ -177,12 +177,12 @@ socket.send(float32Chunk.buffer);
   "channels": 1,
   "sourceSampleRate": 48000,
   "analysisSampleRate": 16000,
-  "frameLength": 1024,
-  "hopLength": 160,
+  "frameLength": 5120,
+  "hopLength": 800,
   "bpm": 120,
   "clipLengthBeats": 8,
   "quantize": "1/16",
-  "source": "dsp_acf"
+  "source": "rmvpe"
 }
 ```
 
@@ -199,7 +199,7 @@ socket.send(float32Chunk.buffer);
   "cents": 0.4,
   "voiced": true,
   "confidence": 0.91,
-  "source": "dsp_acf"
+  "source": "rmvpe"
 }
 ```
 
@@ -269,7 +269,7 @@ socket.send(float32Chunk.buffer);
 | DSP | 백엔드에 기본 내장된 autocorrelation 기반 pitch 추정기입니다. 설치가 가볍고 바로 동작합니다. | `requirements.txt` |
 | RMVPE | 보컬/허밍 pitch 추정 품질을 높이기 위한 모델 기반 추정기입니다. 실시간 스트림에서는 지연이 더 커질 수 있습니다. | `requirements.txt` + `requirements-rmvpe.txt` |
 
-녹음 후 변환 API는 `.env`의 `AI_PREFER_RMVPE=true`를 따릅니다. 실시간 WebSocket은 낮은 지연을 위해 기본적으로 DSP를 사용하고, 연결 설정에서 `preferRmvpe=true`를 보낼 때만 RMVPE를 시도합니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
+녹음 후 변환 API와 실시간 WebSocket은 기본적으로 `.env`의 `AI_PREFER_RMVPE=true`를 따릅니다. 따라서 현재 기본 동작은 RMVPE 우선입니다. 낮은 지연이 더 중요하면 WebSocket 연결 설정에서 `preferRmvpe=false`를 보내 DSP를 강제로 사용할 수 있습니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
 
 ```env
 AI_PREFER_RMVPE=true

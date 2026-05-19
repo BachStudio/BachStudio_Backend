@@ -46,7 +46,7 @@ class RealtimeHummingSession:
 		bpm: float = 120.0,
 		clip_length_beats: float = 8.0,
 		quantize: str = DEFAULT_QUANTIZE,
-		prefer_rmvpe: bool = False,
+		prefer_rmvpe: bool = True,
 	):
 		self.source_sample_rate = max(1, int(source_sample_rate))
 		self.bpm = max(1.0, float(bpm))
@@ -297,7 +297,7 @@ def session_from_mapping(mapping: Any) -> RealtimeHummingSession:
 		bpm=float(read_value(mapping, "bpm", 120.0)),
 		clip_length_beats=float(read_value(mapping, "clipLengthBeats", 8.0)),
 		quantize=str(read_value(mapping, "quantize", DEFAULT_QUANTIZE)),
-		prefer_rmvpe=read_bool(mapping, "preferRmvpe", False),
+		prefer_rmvpe=read_bool(mapping, "preferRmvpe", settings.AI_PREFER_RMVPE),
 	)
 
 
