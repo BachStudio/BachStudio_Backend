@@ -18,6 +18,7 @@ from app.schemas.humming import HummingNote
 from app.services.humming import (
 	DEFAULT_QUANTIZE,
 	estimate_key,
+	frames_to_notes,
 	midi_to_note_name,
 	ms_to_beats,
 	parse_quantize,
@@ -85,11 +86,14 @@ class RealtimeHummingSession:
 		self.last_timestamp: float | None = None
 		self.last_midi: int | None = None
 		self.notes: list[HummingNote] = []
+		self.final_samples: list[float] = []
+		self.max_final_samples = max(1, int(settings.AI_MAX_AUDIO_SECONDS * TARGET_SAMPLE_RATE))
 
 	def accept_bytes(self, payload: bytes) -> list[dict[str, Any]]:
 		samples = decode_float32le(payload)
 		target_samples = resample_mono(samples, self.source_sample_rate, TARGET_SAMPLE_RATE)
 		self.buffer.extend(target_samples)
+		self.append_final_samples(target_samples)
 
 		events: list[dict[str, Any]] = []
 		while len(self.buffer) >= self.engine.config.frame_length:
@@ -109,14 +113,52 @@ class RealtimeHummingSession:
 		final_event = self.close_current_segment(reason="stop")
 		if final_event is not None:
 			events.append(final_event)
+
+		final_notes, final_source = self.finalize_with_rmvpe()
 		events.append(
 			{
 				"type": "complete",
-				"key": estimate_key(self.notes),
-				"notes": [note.model_dump() for note in self.notes],
+				"mode": "hybrid_rmvpe",
+				"key": estimate_key(final_notes),
+				"source": final_source,
+				"liveSource": "rmvpe" if self.engine.estimator.__class__.__name__ == "RmvpePitchEstimator" else "dsp_acf",
+				"notes": [note.model_dump() for note in final_notes],
+				"liveNotes": [note.model_dump() for note in self.notes],
 			}
 		)
 		return events
+
+	def append_final_samples(self, samples: list[float]) -> None:
+		if len(self.final_samples) >= self.max_final_samples:
+			return
+		remaining = self.max_final_samples - len(self.final_samples)
+		self.final_samples.extend(samples[:remaining])
+
+	def finalize_with_rmvpe(self) -> tuple[list[HummingNote], str]:
+		if not self.final_samples:
+			source = "rmvpe" if self.engine.estimator.__class__.__name__ == "RmvpePitchEstimator" else "dsp_acf"
+			return self.notes, source
+
+		final_engine = RealtimePitchEngine(
+			EngineConfig(
+				sample_rate=TARGET_SAMPLE_RATE,
+				frame_length=5120,
+				hop_length=800,
+				prefer_rmvpe=True,
+				rmvpe_model_path=settings.AI_RMVPE_MODEL_PATH,
+				confidence_threshold=settings.AI_CONFIDENCE_THRESHOLD,
+			)
+		)
+		frames: list[PitchFrame] = []
+		final_engine.run_samples(self.final_samples, frames.append)
+		final_notes = frames_to_notes(
+			frames,
+			bpm=self.bpm,
+			clip_length_beats=self.clip_length_beats,
+			quantize=self.quantize,
+		)
+		final_source = "rmvpe" if final_engine.estimator.__class__.__name__ == "RmvpePitchEstimator" else "dsp_acf"
+		return final_notes or self.notes, final_source
 
 	def frame_event(self, frame: PitchFrame) -> dict[str, Any]:
 		midi = int(round(frame.midi)) if frame.midi is not None and math.isfinite(frame.midi) else None

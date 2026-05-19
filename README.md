@@ -100,7 +100,7 @@ GET http://127.0.0.1:8000/api/v1/health
 
 ## Humming AI 실시간 기능
 
-프론트엔드의 피아노롤 `Humming AI` 패널에서 마이크 입력을 받으면, 프론트는 짧은 PCM 오디오 chunk를 WebSocket으로 계속 보냅니다. 백엔드는 chunk가 들어올 때마다 pitch를 분석하고, 프론트가 바로 그릴 수 있는 이벤트를 다시 보냅니다.
+프론트엔드의 피아노롤 `Humming AI` 패널에서 마이크 입력을 받으면, 프론트는 짧은 PCM 오디오 chunk를 WebSocket으로 계속 보냅니다. 백엔드는 chunk가 들어올 때마다 RMVPE로 pitch를 분석하고, 프론트가 바로 그릴 수 있는 이벤트를 다시 보냅니다. 동시에 서버는 들어온 오디오를 짧게 누적했다가 stop 시점에 RMVPE로 전체 재분석을 한 번 더 수행합니다.
 
 실시간 흐름은 아래와 같습니다.
 
@@ -108,9 +108,10 @@ GET http://127.0.0.1:8000/api/v1/health
 2. 연결 직후 백엔드는 `ready` 이벤트를 보냅니다.
 3. 프론트엔드는 `AudioContext` 또는 `AudioWorklet`에서 얻은 mono `Float32Array` PCM chunk를 binary message로 보냅니다.
 4. 백엔드는 chunk를 16 kHz mono 분석 샘플로 맞추고 내부 `app/ai_engine`의 `RealtimePitchEngine`으로 pitch frame을 분석합니다.
-5. 백엔드는 `pitch` 이벤트를 계속 반환합니다.
+5. 백엔드는 RMVPE 기반 `pitch` 이벤트를 계속 반환합니다.
 6. voiced frame이 이어지면 `note_on`, `note_update`, `note_off` 이벤트로 note segment를 실시간 추적합니다.
-7. 프론트가 `{"type":"stop"}`을 보내면 백엔드는 마지막 note를 닫고 `complete` 이벤트로 최종 `notes` 배열을 반환합니다.
+7. 프론트가 `{"type":"stop"}`을 보내면 백엔드는 누적 오디오 전체를 RMVPE로 다시 분석합니다.
+8. `complete.notes`에는 최종 RMVPE 재분석 결과를, `complete.liveNotes`에는 실시간 추적 중 만들어진 미리보기 note를 반환합니다.
 
 ### WebSocket 요청
 
@@ -242,12 +243,15 @@ socket.send(float32Chunk.buffer);
 }
 ```
 
-백엔드는 최종 결과를 반환합니다.
+백엔드는 최종 결과를 반환합니다. 이때 `notes`는 stop 후 RMVPE로 전체 오디오를 다시 분석한 최종 결과이고, `liveNotes`는 실시간 이벤트를 만들면서 누적한 미리보기 결과입니다. 프론트에서 피아노롤에 최종 반영할 때는 `notes`를 쓰는 것을 권장합니다.
 
 ```json
 {
   "type": "complete",
+  "mode": "hybrid_rmvpe",
   "key": "A major/minor",
+  "source": "rmvpe",
+  "liveSource": "rmvpe",
   "notes": [
     {
       "midi": 69,
@@ -255,6 +259,15 @@ socket.send(float32Chunk.buffer);
       "startBeat": 0,
       "durationBeats": 1,
       "confidence": 0.9
+    }
+  ],
+  "liveNotes": [
+    {
+      "midi": 69,
+      "note": "A4",
+      "startBeat": 0,
+      "durationBeats": 0.75,
+      "confidence": 0.88
     }
   ]
 }
@@ -269,7 +282,7 @@ socket.send(float32Chunk.buffer);
 | DSP | 백엔드에 기본 내장된 autocorrelation 기반 pitch 추정기입니다. 설치가 가볍고 바로 동작합니다. | `requirements.txt` |
 | RMVPE | 보컬/허밍 pitch 추정 품질을 높이기 위한 모델 기반 추정기입니다. 실시간 스트림에서는 지연이 더 커질 수 있습니다. | `requirements.txt` + `requirements-rmvpe.txt` |
 
-녹음 후 변환 API와 실시간 WebSocket은 기본적으로 `.env`의 `AI_PREFER_RMVPE=true`를 따릅니다. 따라서 현재 기본 동작은 RMVPE 우선입니다. 낮은 지연이 더 중요하면 WebSocket 연결 설정에서 `preferRmvpe=false`를 보내 DSP를 강제로 사용할 수 있습니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
+녹음 후 변환 API와 실시간 WebSocket은 기본적으로 `.env`의 `AI_PREFER_RMVPE=true`를 따릅니다. 따라서 현재 기본 동작은 RMVPE 우선입니다. 실시간 WebSocket은 live pitch도 RMVPE로 분석하고, stop 후 최종 `complete.notes`도 누적 오디오를 RMVPE로 다시 분석해서 만듭니다. 낮은 지연이 더 중요하면 WebSocket 연결 설정에서 `preferRmvpe=false`를 보내 live 분석만 DSP로 강제할 수 있지만, 현재 권장값은 `true`입니다. RMVPE 패키지나 모델 로딩에 실패하면 자동으로 DSP로 fallback합니다.
 
 ```env
 AI_PREFER_RMVPE=true

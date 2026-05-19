@@ -58,7 +58,9 @@ class RealtimePitchEngine:
 
 	def run_wav(self, wav_path: str | Path, on_frame: Callable[[PitchFrame], None]) -> None:
 		samples, _ = load_wav_mono(wav_path, self.config.sample_rate)
+		self.run_samples(samples, on_frame)
 
+	def run_samples(self, samples: list[float], on_frame: Callable[[PitchFrame], None]) -> None:
 		if hasattr(self.estimator, "estimate_series"):
 			for timestamp_ms, raw in self.estimator.estimate_series(samples):
 				on_frame(self._to_pitch_frame(raw, timestamp_ms))
