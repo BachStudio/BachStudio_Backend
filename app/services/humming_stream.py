@@ -22,8 +22,7 @@ from app.services.humming import (
 	midi_to_note_name,
 	ms_to_beats,
 	parse_quantize,
-	quantize_floor,
-	quantize_round,
+	quantize_note_bounds,
 )
 
 
@@ -110,6 +109,8 @@ class RealtimeHummingSession:
 
 	def finish(self) -> list[dict[str, Any]]:
 		events: list[dict[str, Any]] = []
+		if self.current_segment is not None and self.final_samples:
+			self.current_segment.end_ms = max(self.current_segment.end_ms, self.total_received_ms)
 		final_event = self.close_current_segment(reason="stop")
 		if final_event is not None:
 			events.append(final_event)
@@ -234,11 +235,12 @@ class RealtimeHummingSession:
 
 	def segment_to_note(self, segment: LiveSegment) -> HummingNote:
 		midi = int(round(median(segment.midis)))
-		start_beat = quantize_floor(ms_to_beats(segment.start_ms, self.bpm), self.quantum)
-		duration_beat = ms_to_beats(max(self.hop_ms, segment.end_ms - segment.start_ms), self.bpm)
-		duration_beat = max(self.quantum, quantize_round(duration_beat, self.quantum))
-		if start_beat < self.clip_length_beats:
-			duration_beat = min(duration_beat, self.clip_length_beats - start_beat)
+		start_beat, duration_beat = quantize_note_bounds(
+			ms_to_beats(segment.start_ms, self.bpm),
+			ms_to_beats(max(segment.start_ms + self.hop_ms, segment.end_ms), self.bpm),
+			self.quantum,
+			self.clip_length_beats,
+		)
 
 		return HummingNote(
 			midi=max(0, min(127, midi)),
@@ -260,6 +262,10 @@ class RealtimeHummingSession:
 	@property
 	def hop_ms(self) -> float:
 		return (self.engine.config.hop_length / TARGET_SAMPLE_RATE) * 1000.0
+
+	@property
+	def total_received_ms(self) -> float:
+		return (len(self.final_samples) / TARGET_SAMPLE_RATE) * 1000.0
 
 
 async def stream_humming(websocket: WebSocket) -> None:

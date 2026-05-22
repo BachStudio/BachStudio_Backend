@@ -140,16 +140,15 @@ def frames_to_notes(
 
 	for segment in segments:
 		midi = int(round(median(segment.midis)))
-		start_beat = ms_to_beats(segment.start_ms, bpm)
-		duration_beat = ms_to_beats(max(hop_ms, segment.end_ms - segment.start_ms), bpm)
-
-		start_beat = quantize_floor(start_beat, quantum)
-		duration_beat = max(quantum, quantize_round(duration_beat, quantum))
+		start_beat, duration_beat = quantize_note_bounds(
+			ms_to_beats(segment.start_ms, bpm),
+			ms_to_beats(max(segment.start_ms + hop_ms, segment.end_ms), bpm),
+			quantum,
+			clip_length_beats,
+		)
 
 		if start_beat >= clip_length_beats:
 			continue
-
-		duration_beat = min(duration_beat, clip_length_beats - start_beat)
 		if duration_beat < settings.AI_MIN_NOTE_DURATION_BEATS:
 			continue
 
@@ -169,22 +168,26 @@ def frames_to_notes(
 def build_segments(frames: list[PitchFrame], hop_ms: float) -> list[_Segment]:
 	segments: list[_Segment] = []
 	current: _Segment | None = None
-	last_timestamp: float | None = None
+	last_voiced_timestamp: float | None = None
 	last_midi: int | None = None
 
 	for frame in frames:
+		timestamp = max(0.0, float(frame.timestamp_ms))
 		midi = frame_midi(frame)
 		if midi is None:
-			if current is not None and last_timestamp is not None:
-				current.end_ms = last_timestamp + hop_ms
-			current = None
-			last_timestamp = None
-			last_midi = None
+			if (
+				current is not None
+				and last_voiced_timestamp is not None
+				and timestamp - last_voiced_timestamp > settings.AI_MAX_FRAME_GAP_MS
+			):
+				current.end_ms = last_voiced_timestamp + hop_ms
+				current = None
+				last_voiced_timestamp = None
+				last_midi = None
 			continue
 
-		timestamp = max(0.0, float(frame.timestamp_ms))
 		should_start = current is None
-		if last_timestamp is not None and timestamp - last_timestamp > settings.AI_MAX_FRAME_GAP_MS:
+		if last_voiced_timestamp is not None and timestamp - last_voiced_timestamp > settings.AI_MAX_FRAME_GAP_MS:
 			should_start = True
 		if last_midi is not None and abs(midi - last_midi) > settings.AI_MAX_PITCH_JUMP_SEMITONES:
 			should_start = True
@@ -202,7 +205,7 @@ def build_segments(frames: list[PitchFrame], hop_ms: float) -> list[_Segment]:
 			current.confidences.append(frame.confidence)
 			current.end_ms = timestamp + hop_ms
 
-		last_timestamp = timestamp
+		last_voiced_timestamp = timestamp
 		last_midi = midi
 
 	return segments
@@ -278,6 +281,20 @@ def quantize_floor(value: float, quantum: float) -> float:
 
 def quantize_round(value: float, quantum: float) -> float:
 	return round(value / quantum) * quantum
+
+
+def quantize_note_bounds(
+	start_beat: float,
+	end_beat: float,
+	quantum: float,
+	clip_length_beats: float,
+) -> tuple[float, float]:
+	start = max(0.0, quantize_round(start_beat, quantum))
+	end = max(start + quantum, quantize_round(end_beat, quantum))
+	if start >= clip_length_beats:
+		return start, quantum
+	end = min(max(end, start + quantum), clip_length_beats)
+	return start, max(quantum, end - start)
 
 
 def midi_to_note_name(midi: int) -> str:
