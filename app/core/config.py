@@ -18,11 +18,14 @@ class Settings(BaseSettings):
 
 	AI_PREFER_RMVPE: bool = True
 	AI_RMVPE_MODEL_PATH: str | None = None
-	AI_CONFIDENCE_THRESHOLD: float = 0.12
+	AI_CONFIDENCE_THRESHOLD: float = 0.30
 	AI_MIN_NOTE_DURATION_BEATS: float = 0.0625
 	AI_MAX_FRAME_GAP_MS: float = 140.0
-	AI_MAX_PITCH_JUMP_SEMITONES: int = 1
-	AI_MAX_AUDIO_SECONDS: float = 12.0
+	AI_MAX_PITCH_JUMP_SEMITONES: float = 0.75
+	AI_SNAP_TO_SCALE: bool = True
+	AI_SCALE_SNAP_MAX_SEMITONES: float = 1.0
+	AI_MAX_UPLOAD_AUDIO_SECONDS: float = 300.0
+	AI_MAX_REALTIME_AUDIO_SECONDS: float = 300.0
 
 	SUPABASE_URL: str = Field(default="https://example.supabase.co")
 	SUPABASE_ANON_KEY: str = Field(default="example-anon-key")

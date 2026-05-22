@@ -145,7 +145,7 @@ ws://127.0.0.1:8000/api/humming/stream?sampleRate=48000&bpm=120&clipLengthBeats=
 | --- | --- | --- |
 | `sampleRate` | 브라우저 `AudioContext.sampleRate` 값입니다. 보통 `48000` 또는 `44100`입니다. | `48000` |
 | `bpm` | 현재 프로젝트 BPM입니다. | `120` |
-| `clipLengthBeats` | 현재 피아노롤 클립 길이입니다. | `8` |
+| `clipLengthBeats` | 현재 피아노롤 클립 길이입니다. 업로드 오디오가 이보다 길면 백엔드는 실제 분석된 오디오 길이에 맞춰 내부 범위를 자동 확장합니다. | `8` |
 | `quantize` | 노트 시작/길이 보정 단위입니다. | `1/16` |
 | `preferRmvpe` | 실시간 스트림에서 RMVPE를 먼저 쓸지 여부입니다. 생략하면 `.env`의 `AI_PREFER_RMVPE` 값을 따릅니다. 낮은 지연이 더 중요하면 `false`로 보낼 수 있습니다. | `.env`의 `AI_PREFER_RMVPE` |
 
@@ -243,7 +243,7 @@ socket.send(float32Chunk.buffer);
 }
 ```
 
-백엔드는 최종 결과를 반환합니다. 이때 `notes`는 stop 후 RMVPE로 전체 오디오를 다시 분석한 최종 결과이고, `liveNotes`는 실시간 이벤트를 만들면서 누적한 미리보기 결과입니다. 프론트에서 피아노롤에 최종 반영할 때는 `notes`를 쓰는 것을 권장합니다.
+백엔드는 최종 결과를 반환합니다. 이때 `notes`는 stop 후 RMVPE로 누적 오디오를 다시 분석한 최종 결과이고, `liveNotes`는 실시간 이벤트를 만들면서 누적한 미리보기 결과입니다. 프론트에서 피아노롤에 최종 반영할 때는 `notes`를 쓰는 것을 권장합니다. `truncated=true`면 실시간 최종 재분석용 오디오가 `maxSeconds`까지만 저장된 상태입니다.
 
 ```json
 {
@@ -261,6 +261,10 @@ socket.send(float32Chunk.buffer);
       "confidence": 0.9
     }
   ],
+  "truncated": false,
+  "maxSeconds": 300,
+  "analyzedSeconds": 4,
+  "receivedSeconds": 4,
   "liveNotes": [
     {
       "midi": 69,
@@ -287,6 +291,10 @@ socket.send(float32Chunk.buffer);
 ```env
 AI_PREFER_RMVPE=true
 AI_RMVPE_MODEL_PATH=
+AI_CONFIDENCE_THRESHOLD=0.30
+AI_MAX_PITCH_JUMP_SEMITONES=0.75
+AI_SNAP_TO_SCALE=true
+AI_SCALE_SNAP_MAX_SEMITONES=1.0
 ```
 
 `AI_RMVPE_MODEL_PATH`는 `BachStudio_Ai` 폴더 경로가 아니라 RMVPE 모델 파일 경로입니다. `rmvpe-onnx`가 기본 모델을 알아서 찾을 수 있는 환경이면 비워둬도 됩니다. 직접 받은 모델 파일을 쓰는 경우에만 아래처럼 적습니다.
@@ -294,6 +302,17 @@ AI_RMVPE_MODEL_PATH=
 ```env
 AI_RMVPE_MODEL_PATH=/absolute/path/to/rmvpe.onnx
 ```
+
+### 음정 안정화 방식
+
+허밍은 실제로 한 음을 불러도 pitch가 계속 흔들립니다. 그래서 백엔드는 RMVPE가 준 pitch를 바로 MIDI로 확정하지 않고 아래 보정을 거칩니다.
+
+- confidence가 낮은 pitch frame은 버립니다. 기본값은 `AI_CONFIDENCE_THRESHOLD=0.30`입니다.
+- 반음 정도의 실제 이동은 새 노트로 분리합니다. 기본값 `AI_MAX_PITCH_JUMP_SEMITONES=0.75`라서 E→F, B→C 같은 반음 이동도 놓치지 않습니다.
+- 한 노트 안에서 튀는 pitch는 confidence 가중 median으로 중심음을 잡습니다.
+- 짧게 생긴 지나가는 오탐 노트는 앞뒤 음이 같으면 흡수합니다.
+- 갑자기 한 옥타브 위/아래로 튄 노트는 앞뒤 문맥을 보고 보정합니다.
+- `AI_SNAP_TO_SCALE=true`이면 최종 노트를 추정한 major/minor scale에 맞춰 한 칸까지 보정합니다. 크로매틱 멜로디를 그대로 살리고 싶으면 `false`로 바꾸면 됩니다.
 
 ## 녹음 후 변환 API
 
@@ -335,7 +354,11 @@ Content-Type: multipart/form-data
       "durationBeats": 1,
       "confidence": 0.9
     }
-  ]
+  ],
+  "truncated": false,
+  "maxSeconds": 300,
+  "analyzedSeconds": 180,
+  "originalSeconds": 180
 }
 ```
 
@@ -349,6 +372,10 @@ Content-Type: multipart/form-data
 | `notes[].startBeat` | 클립 시작점을 0으로 봤을 때 음이 시작하는 beat 위치입니다. |
 | `notes[].durationBeats` | 음 길이입니다. beat 단위입니다. |
 | `notes[].confidence` | AI가 해당 pitch를 얼마나 확신했는지 나타내는 0~1 값입니다. |
+| `truncated` | `true`면 백엔드가 설정된 최대 길이까지만 분석한 것입니다. |
+| `maxSeconds` | 현재 요청에서 허용된 최대 분석 길이입니다. `null`이면 제한이 없습니다. |
+| `analyzedSeconds` | 실제로 AI 분석에 사용된 오디오 길이입니다. |
+| `originalSeconds` | 업로드 원본 파일 길이입니다. 읽을 수 없는 포맷이면 `null`일 수 있습니다. |
 
 ### 프론트엔드에서 사용하는 방식
 
@@ -402,11 +429,14 @@ CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173","http://localhost:
 
 AI_PREFER_RMVPE=true
 AI_RMVPE_MODEL_PATH=
-AI_CONFIDENCE_THRESHOLD=0.12
+AI_CONFIDENCE_THRESHOLD=0.30
 AI_MIN_NOTE_DURATION_BEATS=0.0625
 AI_MAX_FRAME_GAP_MS=140
-AI_MAX_PITCH_JUMP_SEMITONES=1
-AI_MAX_AUDIO_SECONDS=12
+AI_MAX_PITCH_JUMP_SEMITONES=0.75
+AI_SNAP_TO_SCALE=true
+AI_SCALE_SNAP_MAX_SEMITONES=1.0
+AI_MAX_UPLOAD_AUDIO_SECONDS=300
+AI_MAX_REALTIME_AUDIO_SECONDS=300
 ```
 
 주요 설정 설명은 아래와 같습니다.
@@ -419,8 +449,11 @@ AI_MAX_AUDIO_SECONDS=12
 | `AI_CONFIDENCE_THRESHOLD` | 이 값보다 confidence가 낮은 pitch frame은 버립니다. |
 | `AI_MIN_NOTE_DURATION_BEATS` | 너무 짧은 노트를 제거하기 위한 최소 beat 길이입니다. |
 | `AI_MAX_FRAME_GAP_MS` | 이 시간보다 frame 간격이 벌어지면 다른 노트로 분리합니다. |
-| `AI_MAX_PITCH_JUMP_SEMITONES` | pitch가 이 semitone 이상 튀면 다른 노트로 분리합니다. |
-| `AI_MAX_AUDIO_SECONDS` | 한 번에 분석할 최대 오디오 길이입니다. 기본값은 12초입니다. |
+| `AI_MAX_PITCH_JUMP_SEMITONES` | pitch 중심이 이 semitone보다 크게 바뀌면 다른 노트로 분리합니다. 기본값 `0.75`는 반음 이동을 새 노트로 잡기 위한 값입니다. |
+| `AI_SNAP_TO_SCALE` | `true`면 최종 결과를 추정한 major/minor scale에 맞춰 보정합니다. |
+| `AI_SCALE_SNAP_MAX_SEMITONES` | scale 보정 시 최대 몇 semitone까지 이동할 수 있는지 정합니다. |
+| `AI_MAX_UPLOAD_AUDIO_SECONDS` | 파일 업로드 분석에서 허용하는 최대 오디오 길이입니다. 기본값은 300초입니다. `0` 이하로 두면 ffmpeg 변환 시 `-t` 제한을 걸지 않습니다. |
+| `AI_MAX_REALTIME_AUDIO_SECONDS` | 실시간 WebSocket에서 stop 후 최종 재분석을 위해 누적하는 최대 오디오 길이입니다. 기본값은 300초입니다. `0` 이하로 두면 제한 없이 누적합니다. |
 
 ## 필요한 외부 프로그램
 

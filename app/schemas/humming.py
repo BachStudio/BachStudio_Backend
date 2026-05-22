@@ -12,4 +12,7 @@ class HummingNote(BaseModel):
 class HummingTranscriptionResponse(BaseModel):
 	key: str = "Unknown"
 	notes: list[HummingNote]
-
+	truncated: bool = False
+	maxSeconds: float | None = None
+	analyzedSeconds: float = 0
+	originalSeconds: float | None = None
