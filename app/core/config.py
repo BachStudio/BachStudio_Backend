@@ -24,8 +24,8 @@ class Settings(BaseSettings):
 	AI_MAX_PITCH_JUMP_SEMITONES: float = 0.75
 	AI_SNAP_TO_SCALE: bool = True
 	AI_SCALE_SNAP_MAX_SEMITONES: float = 1.0
-	AI_MAX_UPLOAD_AUDIO_SECONDS: float = 300.0
-	AI_MAX_REALTIME_AUDIO_SECONDS: float = 300.0
+	AI_MAX_UPLOAD_AUDIO_SECONDS: float = 0.0
+	AI_MAX_REALTIME_AUDIO_SECONDS: float = 0.0
 
 	SUPABASE_URL: str = Field(default="https://example.supabase.co")
 	SUPABASE_ANON_KEY: str = Field(default="example-anon-key")
