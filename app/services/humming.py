@@ -8,10 +8,12 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, median
+from typing import Any
 
 from fastapi import HTTPException, UploadFile, status
 
 from app.core.config import settings
+from app.ai_engine.audio_io import load_wav_mono
 from app.ai_engine.config import EngineConfig
 from app.ai_engine.engine import RealtimePitchEngine
 from app.ai_engine.types import PitchFrame
@@ -34,6 +36,16 @@ class _Segment:
 	end_ms: float
 	midi_values: list[float]
 	confidences: list[float]
+	rms_values: list[float]
+
+
+@dataclass(slots=True)
+class AudioFeatureFrame:
+	timestamp_ms: float
+	rms: float
+	onset_strength: float
+	silent: bool
+	onset: bool
 
 
 @dataclass(slots=True)
@@ -74,16 +86,20 @@ def transcribe_upload(
 		_write_upload(audio, input_path)
 		audio_info = normalize_audio(input_path, wav_path)
 
-		frames = analyze_wav(wav_path)
+		frames, samples = analyze_wav_with_samples(wav_path)
 		effective_clip_length_beats = max(
 			clip_length_beats,
 			ms_to_beats(audio_info.analyzed_seconds * 1000.0, bpm),
 		)
+		debug = make_segmentation_debug()
 		notes = frames_to_notes(
 			frames,
 			bpm=bpm,
 			clip_length_beats=effective_clip_length_beats,
 			quantize=quantize,
+			samples=samples,
+			sample_rate=16000,
+			debug=debug,
 		)
 
 	return HummingTranscriptionResponse(
@@ -93,6 +109,7 @@ def transcribe_upload(
 		maxSeconds=audio_info.max_seconds,
 		analyzedSeconds=round(audio_info.analyzed_seconds, 3),
 		originalSeconds=round(audio_info.original_seconds, 3) if audio_info.original_seconds is not None else None,
+		debug=debug,
 	)
 
 
@@ -244,17 +261,95 @@ def positive_seconds_or_none(value: float | None) -> float | None:
 	return value if math.isfinite(value) and value > 0.0 else None
 
 
+def make_segmentation_debug() -> dict[str, Any]:
+	debug: dict[str, Any] = {}
+	ensure_segmentation_debug(debug)
+	return debug
+
+
+def ensure_segmentation_debug(debug: dict[str, Any]) -> None:
+	debug.setdefault("removedShortNotes", [])
+	debug.setdefault("mergedSamePitchNotes", [])
+	debug.setdefault("detectedOnsets", [])
+	debug.setdefault("silenceBreaks", [])
+
+
+def record_removed_short_note(
+	debug: dict[str, Any] | None,
+	segment: _Segment,
+	duration_ms: float,
+	reason: str,
+) -> None:
+	if debug is None:
+		return
+	ensure_segmentation_debug(debug)
+	debug["removedShortNotes"].append(
+		{
+			"rawStartSec": round(segment.start_ms / 1000.0, 4),
+			"rawEndSec": round(segment.end_ms / 1000.0, 4),
+			"durationMs": round(duration_ms, 3),
+			"reason": reason,
+		}
+	)
+
+
+def record_merge(debug: dict[str, Any] | None, previous: HummingNote, note: HummingNote, reason: str) -> None:
+	if debug is None:
+		return
+	ensure_segmentation_debug(debug)
+	debug["mergedSamePitchNotes"].append(
+		{
+			"midi": previous.midi,
+			"previousRawEndSec": previous.rawEndSec,
+			"nextRawStartSec": note.rawStartSec,
+			"reason": reason,
+		}
+	)
+
+
+def record_detected_onset(debug: dict[str, Any] | None, timestamp_ms: float, frame_rms: float, strength: float) -> None:
+	if debug is None:
+		return
+	ensure_segmentation_debug(debug)
+	debug["detectedOnsets"].append(
+		{
+			"timeSec": round(timestamp_ms / 1000.0, 4),
+			"rms": round(frame_rms, 6),
+			"strength": round(strength, 6),
+		}
+	)
+
+
+def record_silence_break(debug: dict[str, Any] | None, timestamp_ms: float, duration_ms: float) -> None:
+	if debug is None:
+		return
+	ensure_segmentation_debug(debug)
+	debug["silenceBreaks"].append(
+		{
+			"timeSec": round(timestamp_ms / 1000.0, 4),
+			"durationMs": round(max(0.0, duration_ms), 3),
+		}
+	)
+
+
 def analyze_wav(wav_path: Path) -> list[PitchFrame]:
+	frames, _ = analyze_wav_with_samples(wav_path)
+	return frames
+
+
+def analyze_wav_with_samples(wav_path: Path) -> tuple[list[PitchFrame], list[float]]:
+	samples, _ = load_wav_mono(wav_path, 16000)
 	engine = RealtimePitchEngine(
 		EngineConfig(
+			sample_rate=16000,
 			prefer_rmvpe=settings.AI_PREFER_RMVPE,
 			rmvpe_model_path=settings.AI_RMVPE_MODEL_PATH,
 			confidence_threshold=settings.AI_CONFIDENCE_THRESHOLD,
 		)
 	)
 	frames: list[PitchFrame] = []
-	engine.run_wav(wav_path, frames.append)
-	return frames
+	engine.run_samples(samples, frames.append)
+	return frames, samples
 
 
 def frames_to_notes(
@@ -263,18 +358,29 @@ def frames_to_notes(
 	bpm: float,
 	clip_length_beats: float,
 	quantize: str = DEFAULT_QUANTIZE,
+	samples: list[float] | None = None,
+	sample_rate: int = 16000,
+	debug: dict[str, Any] | None = None,
 ) -> list[HummingNote]:
 	if not frames:
 		return []
 
+	if debug is not None:
+		ensure_segmentation_debug(debug)
 	quantum = parse_quantize(quantize)
 	hop_ms = infer_hop_ms(frames)
-	segments = build_segments(frames, hop_ms)
+	features = build_audio_features(frames, samples, sample_rate, hop_ms, debug)
+	segments = build_segments(frames, hop_ms, features, debug)
 	notes: list[HummingNote] = []
 
 	for segment in segments:
 		midi = segment_midi(segment)
 		if midi is None:
+			continue
+
+		raw_duration_ms = max(0.0, segment.end_ms - segment.start_ms)
+		if raw_duration_ms < settings.AI_MIN_NOTE_DURATION_MS:
+			record_removed_short_note(debug, segment, raw_duration_ms, "raw_duration")
 			continue
 
 		start_beat, duration_beat = quantize_note_bounds(
@@ -287,6 +393,7 @@ def frames_to_notes(
 		if start_beat >= clip_length_beats:
 			continue
 		if duration_beat < settings.AI_MIN_NOTE_DURATION_BEATS:
+			record_removed_short_note(debug, segment, raw_duration_ms, "quantized_duration")
 			continue
 
 		notes.append(
@@ -296,36 +403,150 @@ def frames_to_notes(
 				startBeat=round(start_beat, 4),
 				durationBeats=round(duration_beat, 4),
 				confidence=round(max(0.0, min(1.0, mean(segment.confidences))), 4),
+				rawStartSec=round(segment.start_ms / 1000.0, 4),
+				rawEndSec=round(segment.end_ms / 1000.0, 4),
+				quantizedStartBeat=round(start_beat, 4),
+				quantizedDurationBeats=round(duration_beat, 4),
 			)
 		)
 
-	return postprocess_notes(notes, quantum)
+	return postprocess_notes(notes, quantum, debug)
 
 
-def build_segments(frames: list[PitchFrame], hop_ms: float) -> list[_Segment]:
+def build_audio_features(
+	frames: list[PitchFrame],
+	samples: list[float] | None,
+	sample_rate: int,
+	hop_ms: float,
+	debug: dict[str, Any] | None = None,
+) -> list[AudioFeatureFrame]:
+	if not frames:
+		return []
+
+	if not samples:
+		return [
+			AudioFeatureFrame(
+				timestamp_ms=max(0.0, float(frame.timestamp_ms)),
+				rms=1.0 if frame.voiced else 0.0,
+				onset_strength=0.0,
+				silent=not frame.voiced,
+				onset=False,
+			)
+			for frame in frames
+		]
+
+	window_samples = max(1, int((hop_ms / 1000.0) * sample_rate))
+	raw_rms: list[float] = []
+	for frame in frames:
+		start = max(0, int((max(0.0, float(frame.timestamp_ms)) / 1000.0) * sample_rate))
+		end = min(len(samples), start + window_samples)
+		raw_rms.append(rms(samples[start:end]))
+
+	silence_threshold = infer_silence_threshold(raw_rms)
+	features: list[AudioFeatureFrame] = []
+	previous_rms = 0.0
+	for frame, frame_rms in zip(frames, raw_rms, strict=False):
+		onset_strength = max(0.0, frame_rms - previous_rms)
+		onset = is_onset(frame_rms, previous_rms, silence_threshold)
+		timestamp_ms = max(0.0, float(frame.timestamp_ms))
+		if onset:
+			record_detected_onset(debug, timestamp_ms, frame_rms, onset_strength)
+		features.append(
+			AudioFeatureFrame(
+				timestamp_ms=timestamp_ms,
+				rms=frame_rms,
+				onset_strength=onset_strength,
+				silent=frame_rms < silence_threshold,
+				onset=onset,
+			)
+		)
+		previous_rms = frame_rms
+
+	if debug is not None:
+		debug["rmsSilenceThreshold"] = round(silence_threshold, 6)
+
+	return features
+
+
+def rms(values: list[float]) -> float:
+	if not values:
+		return 0.0
+	return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def infer_silence_threshold(rms_values: list[float]) -> float:
+	nonzero = sorted(value for value in rms_values if value > 0.0 and math.isfinite(value))
+	if not nonzero:
+		return settings.AI_SEGMENT_MIN_RMS
+	index = min(len(nonzero) - 1, max(0, int(len(nonzero) * 0.35)))
+	return max(settings.AI_SEGMENT_MIN_RMS, nonzero[index] * 0.45)
+
+
+def is_onset(current_rms: float, previous_rms: float, silence_threshold: float) -> bool:
+	if current_rms < max(silence_threshold, settings.AI_SEGMENT_MIN_RMS):
+		return False
+	if current_rms - previous_rms < settings.AI_ONSET_MIN_RMS_DELTA:
+		return False
+	baseline = max(previous_rms, silence_threshold, 1e-6)
+	return current_rms / baseline >= settings.AI_ONSET_RMS_INCREASE_RATIO
+
+
+def should_break_for_silence(
+	timestamp_ms: float,
+	hop_ms: float,
+	silence_start_ms: float | None,
+	last_voiced_timestamp: float,
+) -> bool:
+	if silence_start_ms is not None:
+		return timestamp_ms + hop_ms - silence_start_ms >= settings.AI_SILENCE_BREAK_MS
+	return timestamp_ms - last_voiced_timestamp >= settings.AI_SILENCE_BREAK_MS
+
+
+def build_segments(
+	frames: list[PitchFrame],
+	hop_ms: float,
+	features: list[AudioFeatureFrame],
+	debug: dict[str, Any] | None = None,
+) -> list[_Segment]:
 	segments: list[_Segment] = []
 	current: _Segment | None = None
 	last_voiced_timestamp: float | None = None
+	silence_start_ms: float | None = None
 
-	for frame in frames:
+	for index, frame in enumerate(frames):
 		timestamp = max(0.0, float(frame.timestamp_ms))
+		feature = features[index] if index < len(features) else None
 		midi_value = frame_midi_value(frame)
-		if midi_value is None:
+		if midi_value is None or (feature is not None and feature.silent):
 			if (
 				current is not None
 				and last_voiced_timestamp is not None
-				and timestamp - last_voiced_timestamp > settings.AI_MAX_FRAME_GAP_MS
+				and should_break_for_silence(timestamp, hop_ms, silence_start_ms, last_voiced_timestamp)
 			):
-				current.end_ms = last_voiced_timestamp + hop_ms
+				break_ms = silence_start_ms if silence_start_ms is not None else last_voiced_timestamp + hop_ms
+				current.end_ms = max(current.start_ms + 1.0, break_ms)
+				record_silence_break(debug, break_ms, timestamp + hop_ms - break_ms)
 				current = None
 				last_voiced_timestamp = None
+				silence_start_ms = None
+			elif current is not None and silence_start_ms is None:
+				silence_start_ms = timestamp
 			continue
 
+		silence_start_ms = None
 		should_start = current is None
 		if last_voiced_timestamp is not None and timestamp - last_voiced_timestamp > settings.AI_MAX_FRAME_GAP_MS:
 			should_start = True
 		current_center = segment_pitch_center(current) if current is not None else None
 		if current_center is not None and abs(midi_value - current_center) > settings.AI_MAX_PITCH_JUMP_SEMITONES:
+			should_start = True
+		if (
+			current is not None
+			and feature is not None
+			and feature.onset
+			and timestamp - current.start_ms >= settings.AI_MIN_NOTE_DURATION_MS
+		):
+			current.end_ms = max(current.start_ms + 1.0, timestamp)
 			should_start = True
 
 		if should_start:
@@ -334,11 +555,13 @@ def build_segments(frames: list[PitchFrame], hop_ms: float) -> list[_Segment]:
 				end_ms=timestamp + hop_ms,
 				midi_values=[midi_value],
 				confidences=[frame.confidence],
+				rms_values=[feature.rms if feature is not None else 0.0],
 			)
 			segments.append(current)
 		else:
 			current.midi_values.append(midi_value)
 			current.confidences.append(frame.confidence)
+			current.rms_values.append(feature.rms if feature is not None else 0.0)
 			current.end_ms = timestamp + hop_ms
 
 		last_voiced_timestamp = timestamp
@@ -346,12 +569,16 @@ def build_segments(frames: list[PitchFrame], hop_ms: float) -> list[_Segment]:
 	return segments
 
 
-def postprocess_notes(notes: list[HummingNote], quantum: float) -> list[HummingNote]:
+def postprocess_notes(
+	notes: list[HummingNote],
+	quantum: float,
+	debug: dict[str, Any] | None = None,
+) -> list[HummingNote]:
 	notes = correct_octave_outliers(notes)
 	if settings.AI_SNAP_TO_SCALE:
 		notes = snap_notes_to_inferred_scale(notes)
-	notes = absorb_short_pitch_glitches(notes, quantum)
-	return merge_adjacent_notes(notes, quantum)
+	notes = absorb_short_pitch_glitches(notes, quantum, debug)
+	return merge_adjacent_notes(notes, quantum, debug)
 
 
 def correct_octave_outliers(notes: list[HummingNote]) -> list[HummingNote]:
@@ -416,7 +643,11 @@ def snap_notes_to_inferred_scale(notes: list[HummingNote]) -> list[HummingNote]:
 	return snapped
 
 
-def absorb_short_pitch_glitches(notes: list[HummingNote], quantum: float) -> list[HummingNote]:
+def absorb_short_pitch_glitches(
+	notes: list[HummingNote],
+	quantum: float,
+	debug: dict[str, Any] | None = None,
+) -> list[HummingNote]:
 	if len(notes) < 3:
 		return notes
 
@@ -431,14 +662,23 @@ def absorb_short_pitch_glitches(notes: list[HummingNote], quantum: float) -> lis
 				first.midi == third.midi
 				and middle.durationBeats <= quantum
 				and abs(middle.midi - first.midi) <= 2
+				and raw_note_duration_ms(middle) < settings.AI_MIN_NOTE_DURATION_MS
+				and middle.confidence + 0.15 < min(first.confidence, third.confidence)
 			):
+				absorbed = first.model_copy(
+					update={
+						"durationBeats": round(third.startBeat + third.durationBeats - first.startBeat, 4),
+						"confidence": round(mean([first.confidence, middle.confidence, third.confidence]), 4),
+						"rawEndSec": third.rawEndSec,
+						"quantizedDurationBeats": round(
+							third.startBeat + third.durationBeats - first.startBeat,
+							4,
+						),
+					}
+				)
+				record_merge(debug, first, third, "absorbed_low_confidence_pitch_glitch")
 				out.append(
-					first.model_copy(
-						update={
-							"durationBeats": round(third.startBeat + third.durationBeats - first.startBeat, 4),
-							"confidence": round(mean([first.confidence, middle.confidence, third.confidence]), 4),
-						}
-					)
+					absorbed
 				)
 				index += 3
 				continue
@@ -449,7 +689,11 @@ def absorb_short_pitch_glitches(notes: list[HummingNote], quantum: float) -> lis
 	return out
 
 
-def merge_adjacent_notes(notes: list[HummingNote], quantum: float) -> list[HummingNote]:
+def merge_adjacent_notes(
+	notes: list[HummingNote],
+	quantum: float,
+	debug: dict[str, Any] | None = None,
+) -> list[HummingNote]:
 	if not notes:
 		return []
 
@@ -457,13 +701,35 @@ def merge_adjacent_notes(notes: list[HummingNote], quantum: float) -> list[Hummi
 	for note in notes[1:]:
 		previous = merged[-1]
 		previous_end = previous.startBeat + previous.durationBeats
-		if note.midi == previous.midi and note.startBeat - previous_end <= quantum:
-			previous.durationBeats = round(note.startBeat + note.durationBeats - previous.startBeat, 4)
+		raw_gap_ms = raw_note_gap_ms(previous, note)
+		if (
+			note.midi == previous.midi
+			and note.startBeat - previous_end <= quantum
+			and raw_gap_ms is not None
+			and raw_gap_ms <= settings.AI_SAME_PITCH_MERGE_GAP_MS
+		):
+			new_duration = round(note.startBeat + note.durationBeats - previous.startBeat, 4)
+			previous.durationBeats = new_duration
+			previous.quantizedDurationBeats = new_duration
+			previous.rawEndSec = note.rawEndSec
 			previous.confidence = round((previous.confidence + note.confidence) / 2.0, 4)
+			record_merge(debug, previous, note, "same_pitch_gap_under_threshold")
 			continue
 		merged.append(note)
 
 	return merged
+
+
+def raw_note_duration_ms(note: HummingNote) -> float:
+	if note.rawStartSec is None or note.rawEndSec is None:
+		return note.durationBeats * 500.0
+	return max(0.0, (note.rawEndSec - note.rawStartSec) * 1000.0)
+
+
+def raw_note_gap_ms(previous: HummingNote, note: HummingNote) -> float | None:
+	if previous.rawEndSec is None or note.rawStartSec is None:
+		return None
+	return max(0.0, (note.rawStartSec - previous.rawEndSec) * 1000.0)
 
 
 def segment_midi(segment: _Segment) -> int | None:

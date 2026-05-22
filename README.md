@@ -258,13 +258,31 @@ socket.send(float32Chunk.buffer);
       "note": "A4",
       "startBeat": 0,
       "durationBeats": 1,
-      "confidence": 0.9
+      "confidence": 0.9,
+      "rawStartSec": 0,
+      "rawEndSec": 0.48,
+      "quantizedStartBeat": 0,
+      "quantizedDurationBeats": 1
     }
   ],
   "truncated": false,
   "maxSeconds": 300,
   "analyzedSeconds": 4,
   "receivedSeconds": 4,
+  "debug": {
+    "live": {
+      "removedShortNotes": [],
+      "mergedSamePitchNotes": [],
+      "detectedOnsets": [],
+      "silenceBreaks": []
+    },
+    "final": {
+      "removedShortNotes": [],
+      "mergedSamePitchNotes": [],
+      "detectedOnsets": [],
+      "silenceBreaks": []
+    }
+  },
   "liveNotes": [
     {
       "midi": 69,
@@ -352,13 +370,23 @@ Content-Type: multipart/form-data
       "note": "A4",
       "startBeat": 0,
       "durationBeats": 1,
-      "confidence": 0.9
+      "confidence": 0.9,
+      "rawStartSec": 0,
+      "rawEndSec": 0.48,
+      "quantizedStartBeat": 0,
+      "quantizedDurationBeats": 1
     }
   ],
   "truncated": false,
   "maxSeconds": 300,
   "analyzedSeconds": 180,
-  "originalSeconds": 180
+  "originalSeconds": 180,
+  "debug": {
+    "removedShortNotes": [],
+    "mergedSamePitchNotes": [],
+    "detectedOnsets": [],
+    "silenceBreaks": []
+  }
 }
 ```
 
@@ -372,10 +400,18 @@ Content-Type: multipart/form-data
 | `notes[].startBeat` | 클립 시작점을 0으로 봤을 때 음이 시작하는 beat 위치입니다. |
 | `notes[].durationBeats` | 음 길이입니다. beat 단위입니다. |
 | `notes[].confidence` | AI가 해당 pitch를 얼마나 확신했는지 나타내는 0~1 값입니다. |
+| `notes[].rawStartSec` | quantize 전 실제 note 시작 시간입니다. 디버그와 리듬 확인에 사용합니다. |
+| `notes[].rawEndSec` | quantize 전 실제 note 종료 시간입니다. |
+| `notes[].quantizedStartBeat` | 최종 quantize가 적용된 시작 beat입니다. 현재 `startBeat`와 같은 값입니다. |
+| `notes[].quantizedDurationBeats` | 최종 quantize가 적용된 길이입니다. 현재 `durationBeats`와 같은 값입니다. |
 | `truncated` | `true`면 백엔드가 설정된 최대 길이까지만 분석한 것입니다. |
 | `maxSeconds` | 현재 요청에서 허용된 최대 분석 길이입니다. `null`이면 제한이 없습니다. |
 | `analyzedSeconds` | 실제로 AI 분석에 사용된 오디오 길이입니다. |
 | `originalSeconds` | 업로드 원본 파일 길이입니다. 읽을 수 없는 포맷이면 `null`일 수 있습니다. |
+| `debug.removedShortNotes` | 너무 짧아서 제거된 note 후보입니다. |
+| `debug.mergedSamePitchNotes` | 같은 pitch라서 합쳐진 note 후보입니다. |
+| `debug.detectedOnsets` | RMS 기준으로 감지한 발음 시작 후보입니다. |
+| `debug.silenceBreaks` | note를 분리시킨 silence gap입니다. |
 
 ### 프론트엔드에서 사용하는 방식
 
@@ -431,7 +467,13 @@ AI_PREFER_RMVPE=true
 AI_RMVPE_MODEL_PATH=
 AI_CONFIDENCE_THRESHOLD=0.30
 AI_MIN_NOTE_DURATION_BEATS=0.0625
-AI_MAX_FRAME_GAP_MS=140
+AI_MIN_NOTE_DURATION_MS=50
+AI_MAX_FRAME_GAP_MS=70
+AI_SILENCE_BREAK_MS=50
+AI_SEGMENT_MIN_RMS=0.008
+AI_ONSET_RMS_INCREASE_RATIO=1.8
+AI_ONSET_MIN_RMS_DELTA=0.025
+AI_SAME_PITCH_MERGE_GAP_MS=35
 AI_MAX_PITCH_JUMP_SEMITONES=0.75
 AI_SNAP_TO_SCALE=true
 AI_SCALE_SNAP_MAX_SEMITONES=1.0
@@ -447,8 +489,14 @@ AI_MAX_REALTIME_AUDIO_SECONDS=300
 | `AI_PREFER_RMVPE` | `true`면 RMVPE를 먼저 시도하고, 실패하면 내장 DSP 추정기로 fallback합니다. |
 | `AI_RMVPE_MODEL_PATH` | 선택적 RMVPE 모델 파일 경로입니다. 없으면 비워둡니다. `BachStudio_Ai` 폴더 경로를 넣는 값이 아닙니다. |
 | `AI_CONFIDENCE_THRESHOLD` | 이 값보다 confidence가 낮은 pitch frame은 버립니다. |
-| `AI_MIN_NOTE_DURATION_BEATS` | 너무 짧은 노트를 제거하기 위한 최소 beat 길이입니다. |
-| `AI_MAX_FRAME_GAP_MS` | 이 시간보다 frame 간격이 벌어지면 다른 노트로 분리합니다. |
+| `AI_MIN_NOTE_DURATION_BEATS` | quantize 후 너무 짧은 노트를 제거하기 위한 최소 beat 길이입니다. |
+| `AI_MIN_NOTE_DURATION_MS` | quantize 전 raw note가 이 시간보다 짧으면 제거합니다. 기본값은 50ms입니다. |
+| `AI_MAX_FRAME_GAP_MS` | pitch frame 간격이 이 시간보다 벌어지면 다른 노트로 분리합니다. |
+| `AI_SILENCE_BREAK_MS` | 같은 pitch라도 RMS silence가 이 시간 이상 이어지면 새 note로 분리합니다. 기본값은 50ms입니다. |
+| `AI_SEGMENT_MIN_RMS` | note segmentation에서 silence로 볼 최소 RMS 기준입니다. |
+| `AI_ONSET_RMS_INCREASE_RATIO` | RMS가 이전 frame보다 이 비율 이상 커지면 onset 후보로 봅니다. |
+| `AI_ONSET_MIN_RMS_DELTA` | onset으로 인정하기 위한 최소 RMS 증가량입니다. |
+| `AI_SAME_PITCH_MERGE_GAP_MS` | 같은 pitch note를 다시 합칠 수 있는 최대 raw gap입니다. silence 분리를 살리기 위해 기본값은 35ms입니다. |
 | `AI_MAX_PITCH_JUMP_SEMITONES` | pitch 중심이 이 semitone보다 크게 바뀌면 다른 노트로 분리합니다. 기본값 `0.75`는 반음 이동을 새 노트로 잡기 위한 값입니다. |
 | `AI_SNAP_TO_SCALE` | `true`면 최종 결과를 추정한 major/minor scale에 맞춰 보정합니다. |
 | `AI_SCALE_SNAP_MAX_SEMITONES` | scale 보정 시 최대 몇 semitone까지 이동할 수 있는지 정합니다. |

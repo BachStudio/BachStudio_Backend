@@ -19,11 +19,17 @@ from app.services.humming import (
 	DEFAULT_QUANTIZE,
 	estimate_key,
 	frames_to_notes,
+	is_onset,
+	make_segmentation_debug,
 	midi_to_note_name,
 	ms_to_beats,
 	parse_quantize,
 	positive_seconds_or_none,
 	quantize_note_bounds,
+	record_detected_onset,
+	record_removed_short_note,
+	record_silence_break,
+	rms,
 	segment_midi,
 	segment_pitch_center,
 )
@@ -39,6 +45,7 @@ class LiveSegment:
 	end_ms: float
 	midi_values: list[float] = field(default_factory=list)
 	confidences: list[float] = field(default_factory=list)
+	rms_values: list[float] = field(default_factory=list)
 
 
 class RealtimeHummingSession:
@@ -87,7 +94,10 @@ class RealtimeHummingSession:
 		self.current_segment: LiveSegment | None = None
 		self.last_timestamp: float | None = None
 		self.last_pitch_timestamp: float | None = None
+		self.silence_start_ms: float | None = None
+		self.previous_rms = 0.0
 		self.notes: list[HummingNote] = []
+		self.debug = make_segmentation_debug()
 		self.final_samples: list[float] = []
 		self.received_samples = 0
 		self.realtime_limit_seconds = positive_seconds_or_none(settings.AI_MAX_REALTIME_AUDIO_SECONDS)
@@ -109,8 +119,9 @@ class RealtimeHummingSession:
 			frame_samples = self.buffer[: self.engine.config.frame_length]
 			timestamp_ms = (self.processed_samples / TARGET_SAMPLE_RATE) * 1000.0
 			frame = self.engine.process_frame(frame_samples, timestamp_ms)
+			frame_rms = rms(frame_samples[: self.engine.config.hop_length])
 			events.append(self.frame_event(frame))
-			events.extend(self.update_note_tracking(frame))
+			events.extend(self.update_note_tracking(frame, frame_rms))
 
 			del self.buffer[: self.engine.config.hop_length]
 			self.processed_samples += self.engine.config.hop_length
@@ -120,12 +131,20 @@ class RealtimeHummingSession:
 	def finish(self) -> list[dict[str, Any]]:
 		events: list[dict[str, Any]] = []
 		if self.current_segment is not None and self.final_samples:
-			self.current_segment.end_ms = max(self.current_segment.end_ms, self.total_received_ms)
+			if self.silence_start_ms is not None:
+				self.current_segment.end_ms = max(self.current_segment.start_ms + 1.0, self.silence_start_ms)
+				record_silence_break(
+					self.debug,
+					self.silence_start_ms,
+					self.total_received_ms - self.silence_start_ms,
+				)
+			else:
+				self.current_segment.end_ms = max(self.current_segment.end_ms, self.total_received_ms)
 		final_event = self.close_current_segment(reason="stop")
 		if final_event is not None:
 			events.append(final_event)
 
-		final_notes, final_source = self.finalize_with_rmvpe()
+		final_notes, final_source, final_debug = self.finalize_with_rmvpe()
 		events.append(
 			{
 				"type": "complete",
@@ -139,6 +158,10 @@ class RealtimeHummingSession:
 				"maxSeconds": self.realtime_limit_seconds,
 				"analyzedSeconds": round(self.analyzed_seconds, 3),
 				"receivedSeconds": round(self.received_seconds, 3),
+				"debug": {
+					"live": self.debug,
+					"final": final_debug,
+				},
 			}
 		)
 		return events
@@ -152,10 +175,10 @@ class RealtimeHummingSession:
 		remaining = self.max_final_samples - len(self.final_samples)
 		self.final_samples.extend(samples[:remaining])
 
-	def finalize_with_rmvpe(self) -> tuple[list[HummingNote], str]:
+	def finalize_with_rmvpe(self) -> tuple[list[HummingNote], str, dict[str, Any]]:
 		if not self.final_samples:
 			source = "rmvpe" if self.engine.estimator.__class__.__name__ == "RmvpePitchEstimator" else "dsp_acf"
-			return self.notes, source
+			return self.notes, source, make_segmentation_debug()
 
 		final_engine = RealtimePitchEngine(
 			EngineConfig(
@@ -169,14 +192,18 @@ class RealtimeHummingSession:
 		)
 		frames: list[PitchFrame] = []
 		final_engine.run_samples(self.final_samples, frames.append)
+		final_debug = make_segmentation_debug()
 		final_notes = frames_to_notes(
 			frames,
 			bpm=self.bpm,
 			clip_length_beats=self.effective_analyzed_clip_length_beats,
 			quantize=self.quantize,
+			samples=self.final_samples,
+			sample_rate=TARGET_SAMPLE_RATE,
+			debug=final_debug,
 		)
 		final_source = "rmvpe" if final_engine.estimator.__class__.__name__ == "RmvpePitchEstimator" else "dsp_acf"
-		return final_notes or self.notes, final_source
+		return final_notes or self.notes, final_source, final_debug
 
 	def frame_event(self, frame: PitchFrame) -> dict[str, Any]:
 		midi = int(round(frame.midi)) if frame.midi is not None and math.isfinite(frame.midi) else None
@@ -193,27 +220,53 @@ class RealtimeHummingSession:
 			"source": frame.source,
 		}
 
-	def update_note_tracking(self, frame: PitchFrame) -> list[dict[str, Any]]:
+	def update_note_tracking(self, frame: PitchFrame, frame_rms: float) -> list[dict[str, Any]]:
 		midi_value = self.frame_midi_value(frame)
-		if midi_value is None:
-			timestamp = max(0.0, float(frame.timestamp_ms))
+		timestamp = max(0.0, float(frame.timestamp_ms))
+		silent = frame_rms < settings.AI_SEGMENT_MIN_RMS
+		onset = is_onset(frame_rms, self.previous_rms, settings.AI_SEGMENT_MIN_RMS)
+		if onset:
+			record_detected_onset(
+				self.debug,
+				timestamp,
+				frame_rms,
+				max(0.0, frame_rms - self.previous_rms),
+			)
+
+		if midi_value is None or silent:
 			if (
 				self.current_segment is not None
 				and self.last_pitch_timestamp is not None
-				and timestamp - self.last_pitch_timestamp <= settings.AI_MAX_FRAME_GAP_MS
+				and not self.should_close_for_silence(timestamp)
 			):
+				if self.silence_start_ms is None:
+					self.silence_start_ms = timestamp
+				self.previous_rms = frame_rms
 				return []
+			if self.current_segment is not None:
+				break_ms = self.silence_start_ms if self.silence_start_ms is not None else timestamp
+				self.current_segment.end_ms = max(self.current_segment.start_ms + 1.0, break_ms)
+				record_silence_break(self.debug, break_ms, timestamp + self.hop_ms - break_ms)
 			event = self.close_current_segment(reason="unvoiced")
 			self.last_timestamp = None
 			self.last_pitch_timestamp = None
+			self.silence_start_ms = None
+			self.previous_rms = frame_rms
 			return [event] if event is not None else []
 
-		timestamp = max(0.0, float(frame.timestamp_ms))
+		self.silence_start_ms = None
 		should_start = self.current_segment is None
 		if self.last_timestamp is not None and timestamp - self.last_timestamp > settings.AI_MAX_FRAME_GAP_MS:
 			should_start = True
 		current_center = segment_pitch_center(self.current_segment) if self.current_segment is not None else None
 		if current_center is not None and abs(midi_value - current_center) > settings.AI_MAX_PITCH_JUMP_SEMITONES:
+			should_start = True
+		if (
+			self.current_segment is not None
+			and onset
+			and timestamp - self.current_segment.start_ms >= settings.AI_MIN_NOTE_DURATION_MS
+		):
+			self.current_segment.end_ms = max(self.current_segment.start_ms + 1.0, timestamp)
 			should_start = True
 
 		if should_start:
@@ -226,9 +279,11 @@ class RealtimeHummingSession:
 				end_ms=timestamp + self.hop_ms,
 				midi_values=[midi_value],
 				confidences=[frame.confidence],
+				rms_values=[frame_rms],
 			)
 			self.last_timestamp = timestamp
 			self.last_pitch_timestamp = timestamp
+			self.previous_rms = frame_rms
 			note = self.segment_to_note(self.current_segment)
 			events.append({"type": "note_on", "note": note.model_dump()})
 			return events
@@ -236,27 +291,42 @@ class RealtimeHummingSession:
 		if self.current_segment is not None:
 			self.current_segment.midi_values.append(midi_value)
 			self.current_segment.confidences.append(frame.confidence)
+			self.current_segment.rms_values.append(frame_rms)
 			self.current_segment.end_ms = timestamp + self.hop_ms
 
 		self.last_timestamp = timestamp
 		self.last_pitch_timestamp = timestamp
+		self.previous_rms = frame_rms
 		if self.current_segment is None:
 			return []
 		return [{"type": "note_update", "note": self.segment_to_note(self.current_segment).model_dump()}]
+
+	def should_close_for_silence(self, timestamp_ms: float) -> bool:
+		if self.silence_start_ms is None:
+			return False
+		return timestamp_ms + self.hop_ms - self.silence_start_ms >= settings.AI_SILENCE_BREAK_MS
 
 	def close_current_segment(self, *, reason: str) -> dict[str, Any] | None:
 		if self.current_segment is None:
 			return None
 
 		note = self.segment_to_note(self.current_segment)
+		raw_duration_ms = max(0.0, self.current_segment.end_ms - self.current_segment.start_ms)
 		self.current_segment = None
-		if note.durationBeats < settings.AI_MIN_NOTE_DURATION_BEATS:
+		if raw_duration_ms < settings.AI_MIN_NOTE_DURATION_MS or note.durationBeats < settings.AI_MIN_NOTE_DURATION_BEATS:
+			record_removed_short_note(self.debug, self.current_segment_for_debug(note), raw_duration_ms, "live_duration")
 			return None
 		if note.startBeat >= self.effective_received_clip_length_beats:
 			return None
 
 		self.notes.append(note)
 		return {"type": "note_off", "reason": reason, "note": note.model_dump()}
+
+	def current_segment_for_debug(self, note: HummingNote) -> LiveSegment:
+		return LiveSegment(
+			start_ms=(note.rawStartSec or 0.0) * 1000.0,
+			end_ms=(note.rawEndSec or 0.0) * 1000.0,
+		)
 
 	def segment_to_note(self, segment: LiveSegment) -> HummingNote:
 		midi = segment_midi(segment)
@@ -275,6 +345,10 @@ class RealtimeHummingSession:
 			startBeat=round(max(0.0, start_beat), 4),
 			durationBeats=round(max(self.quantum, duration_beat), 4),
 			confidence=round(max(0.0, min(1.0, mean(segment.confidences))), 4),
+			rawStartSec=round(segment.start_ms / 1000.0, 4),
+			rawEndSec=round(segment.end_ms / 1000.0, 4),
+			quantizedStartBeat=round(max(0.0, start_beat), 4),
+			quantizedDurationBeats=round(max(self.quantum, duration_beat), 4),
 		)
 
 	def frame_midi(self, frame: PitchFrame) -> int | None:

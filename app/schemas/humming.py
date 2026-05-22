@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -7,6 +9,10 @@ class HummingNote(BaseModel):
 	startBeat: float = Field(ge=0)
 	durationBeats: float = Field(gt=0)
 	confidence: float = Field(ge=0, le=1)
+	rawStartSec: float | None = None
+	rawEndSec: float | None = None
+	quantizedStartBeat: float | None = None
+	quantizedDurationBeats: float | None = None
 
 
 class HummingTranscriptionResponse(BaseModel):
@@ -16,3 +22,4 @@ class HummingTranscriptionResponse(BaseModel):
 	maxSeconds: float | None = None
 	analyzedSeconds: float = 0
 	originalSeconds: float | None = None
+	debug: dict[str, Any] = Field(default_factory=dict)
