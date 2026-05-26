@@ -47,6 +47,8 @@ class Settings(BaseSettings):
 	GOOGLE_CLIENT_SECRET: str = ""
 	GOOGLE_OAUTH_REDIRECT_URL: str = "http://localhost:5173/auth/callback"
 
+	PROJECT_STORAGE_DIR: str = "data/projects"
+
 	JWT_ALGORITHM: str = "HS256"
 	JWT_EXPIRE_MINUTES: int = 60
 

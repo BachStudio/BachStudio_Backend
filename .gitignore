@@ -10,3 +10,6 @@ venv/
 .vscode/
 
 .env
+
+# Local saved projects
+data/projects/
