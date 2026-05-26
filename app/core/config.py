@@ -1,7 +1,7 @@
 import json
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,8 +34,18 @@ class Settings(BaseSettings):
 	AI_MAX_REALTIME_AUDIO_SECONDS: float = 300.0
 
 	SUPABASE_URL: str = Field(default="https://example.supabase.co")
-	SUPABASE_ANON_KEY: str = Field(default="example-anon-key")
-	SUPABASE_JWT_SECRET: str = Field(default="change-me")
+	SUPABASE_ANON_KEY: str = Field(
+		default="example-anon-key",
+		validation_alias=AliasChoices("SUPABASE_ANON_KEY", "SUPABASE_PUBLISHABLE_KEY"),
+	)
+	SUPABASE_JWT_SECRET: str = Field(
+		default="change-me",
+		validation_alias=AliasChoices("SUPABASE_JWT_SECRET", "JWT_SECRET", "SUPABASE_SECRET_KEY"),
+	)
+
+	GOOGLE_CLIENT_ID: str = ""
+	GOOGLE_CLIENT_SECRET: str = ""
+	GOOGLE_OAUTH_REDIRECT_URL: str = "http://localhost:5173/auth/callback"
 
 	JWT_ALGORITHM: str = "HS256"
 	JWT_EXPIRE_MINUTES: int = 60

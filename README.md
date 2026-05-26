@@ -439,11 +439,68 @@ length = durationBeats * PIANO_STEPS_PER_BEAT
 | `POST` | `/api/v1/humming/transcribe` | 버전 prefix가 붙은 녹음 후 파일 업로드 변환 API입니다. |
 | `POST` | `/api/v1/auth/signup` | 유저 생성 API입니다. Supabase `users` 테이블에 저장을 시도합니다. |
 | `POST` | `/api/v1/auth/login` | 이메일 기반 JWT 토큰을 발급합니다. 현재는 실제 비밀번호 검증이 아니라 개발용 기본 구현입니다. |
+| `GET` | `/api/v1/auth/google/login` | Google OAuth 로그인 URL과 `state`를 발급합니다. |
+| `GET` | `/api/v1/auth/google/url` | `/google/login`과 같은 Google OAuth URL 발급 API입니다. |
+| `POST` | `/api/v1/auth/google/callback` | 프론트 콜백에서 받은 Google `code`를 백엔드 JWT로 교환합니다. |
 | `GET` | `/api/v1/auth/validate` | `Authorization: Bearer <token>` 토큰을 검증합니다. |
 | `GET` | `/api/v1/users/me` | 현재 토큰의 payload를 반환합니다. |
 | `GET` | `/api/v1/users/{user_id}` | Supabase에서 유저를 조회합니다. 실패하면 개발용 fallback 응답을 반환합니다. |
 | `GET` | `/api/v1/items/` | Supabase `items` 목록을 조회합니다. 실패하면 빈 목록을 반환합니다. |
 | `POST` | `/api/v1/items/` | 인증된 유저의 item 생성을 시도합니다. 실패하면 개발용 fallback 응답을 반환합니다. |
+
+## Google 로그인
+
+현재 Google OAuth는 프론트엔드가 콜백을 받고, 백엔드가 Google `code`를 검증해서 BachStudio JWT를 발급하는 구조입니다.
+
+1. 프론트가 로그인 버튼을 누르면 아래 API를 호출합니다.
+
+```http
+GET /api/v1/auth/google/login
+```
+
+응답:
+
+```json
+{
+  "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "state": "random-state"
+}
+```
+
+2. 프론트는 `state`를 `sessionStorage` 등에 저장한 뒤 `authorization_url`로 이동합니다.
+3. Google 로그인 후 `GOOGLE_OAUTH_REDIRECT_URL`로 설정한 프론트 주소에 `code`와 `state`가 붙어서 돌아옵니다.
+4. 프론트는 받은 `state`가 저장해 둔 값과 같은지 확인하고, `code`를 백엔드에 보냅니다.
+
+```http
+POST /api/v1/auth/google/callback
+Content-Type: application/json
+```
+
+```json
+{
+  "code": "google-auth-code",
+  "state": "random-state",
+  "redirectUri": "http://localhost:5173/auth/callback"
+}
+```
+
+응답:
+
+```json
+{
+  "access_token": "bachstudio-jwt",
+  "token_type": "bearer",
+  "user": {
+    "id": "user-id",
+    "email": "user@example.com",
+    "name": "User Name",
+    "picture": "https://...",
+    "provider": "google"
+  }
+}
+```
+
+이후 프론트는 기존 API처럼 `Authorization: Bearer <access_token>` 헤더를 붙이면 됩니다. Supabase `users` 테이블에 `provider`, `provider_id`, `avatar_url` 컬럼이 있으면 같이 저장하고, 없으면 `email`, `name`만 저장을 시도합니다.
 
 ## 환경 변수
 
@@ -455,8 +512,12 @@ API_PREFIX=/api/v1
 DEBUG=true
 
 SUPABASE_URL=https://example.supabase.co
-SUPABASE_ANON_KEY=example-anon-key
-SUPABASE_JWT_SECRET=change-me
+SUPABASE_PUBLISHABLE_KEY=example-publishable-key
+SUPABASE_SECRET_KEY=change-me
+
+GOOGLE_CLIENT_ID=example-google-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=example-google-client-secret
+GOOGLE_OAUTH_REDIRECT_URL=http://localhost:5173/auth/callback
 
 JWT_ALGORITHM=HS256
 JWT_EXPIRE_MINUTES=60
@@ -486,6 +547,12 @@ AI_MAX_REALTIME_AUDIO_SECONDS=300
 | 변수 | 설명 |
 | --- | --- |
 | `CORS_ORIGINS` | 프론트엔드 개발 서버 주소입니다. `.env`에서는 JSON 배열 형태로 넣습니다. |
+| `SUPABASE_URL` | Supabase 프로젝트 URL입니다. |
+| `SUPABASE_PUBLISHABLE_KEY` | Supabase publishable/anon key입니다. 기존 이름인 `SUPABASE_ANON_KEY`도 지원합니다. |
+| `SUPABASE_SECRET_KEY` | 백엔드 JWT 서명에 쓰는 비밀값 fallback입니다. 가능하면 실제 배포에서는 별도 `SUPABASE_JWT_SECRET` 또는 `JWT_SECRET`을 쓰는 것을 권장합니다. |
+| `GOOGLE_CLIENT_ID` | Google Cloud OAuth Client ID입니다. |
+| `GOOGLE_CLIENT_SECRET` | Google Cloud OAuth Client Secret입니다. 백엔드에서만 사용합니다. |
+| `GOOGLE_OAUTH_REDIRECT_URL` | Google 로그인 후 돌아올 프론트엔드 콜백 URL입니다. Google Cloud Console의 Authorized redirect URI와 같아야 합니다. |
 | `AI_PREFER_RMVPE` | `true`면 RMVPE를 먼저 시도하고, 실패하면 내장 DSP 추정기로 fallback합니다. |
 | `AI_RMVPE_MODEL_PATH` | 선택적 RMVPE 모델 파일 경로입니다. 없으면 비워둡니다. `BachStudio_Ai` 폴더 경로를 넣는 값이 아닙니다. |
 | `AI_CONFIDENCE_THRESHOLD` | 이 값보다 confidence가 낮은 pitch frame은 버립니다. |
